@@ -1,0 +1,14 @@
+{
+  "name": "tlda-dev-bot",
+  "version": "0.1.0",
+  "description": "tlda dev bot: developer-machine automation and noticing for the app lane.",
+  "type": "module",
+  "bin": {
+    "dev-bot": "./dev-bot.mjs"
+  },
+  "dependencies": {
+    "@tlda/bot": "file:../../tlda/packages/bot",
+    "ws": "^8.0.0"
+  },
+  "license": "MIT"
+}
