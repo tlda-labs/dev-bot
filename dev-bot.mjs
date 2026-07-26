@@ -49,6 +49,10 @@ const ALLOWED_ENVIRONMENTS = Object.entries(BOT_ENVIRONMENTS)
 const INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_INTERVAL_MS || '', 10) || 60_000
 const FAILURE_COOLDOWN_MS = parseInt(process.env.TLDA_DEV_BOT_FAILURE_COOLDOWN_MS || '', 10) || 5 * 60_000
 const REQUEST_TIMEOUT_MS = parseInt(process.env.TLDA_DEV_BOT_REQUEST_TIMEOUT_MS || '', 10) || 15_000
+const SPAWN_WAKE_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS || '', 10) || 30 * 60_000
+const SPAWN_WAKE_TIMEOUT_MS = parseInt(process.env.TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS || '', 10) || 3 * 60_000
+const SPAWN_WAKE_ENABLED = process.env.TLDA_DEV_BOT_SPAWN_WAKE_ENABLED !== '0'
+const SPAWN_WAKE_MODEL = process.env.TLDA_DEV_BOT_SPAWN_WAKE_MODEL || ''
 const PROBE_DOC = process.env.TLDA_DEV_BOT_DOC || ''
 const ASSET_PATH_OVERRIDE = process.env.TLDA_DEV_BOT_ASSET_PATH_OVERRIDE || ''
 const ALLOW_NONDEFAULT = process.env.TLDA_DEV_BOT_ALLOW_NONDEFAULT === '1'
@@ -100,6 +104,13 @@ class ProbeSetupError extends Error {
   constructor(message) {
     super(message)
     this.name = 'ProbeSetupError'
+  }
+}
+
+class ProbeIndeterminateError extends Error {
+  constructor(message) {
+    super(message)
+    this.name = 'ProbeIndeterminateError'
   }
 }
 
@@ -189,6 +200,26 @@ async function fetchJson(base, urlPath, { method = 'GET', body = undefined } = {
   }
 }
 
+async function fetchJsonMaybe(base, urlPath, { method = 'GET', body = undefined, okStatuses = [] } = {}) {
+  const res = await fetch(`${base}${urlPath}`, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  })
+  const text = await res.text()
+  if (!res.ok && !okStatuses.includes(res.status)) {
+    throw new Error(`${method} ${urlPath} returned HTTP ${res.status}${text ? ` ${text.slice(0, 200)}` : ''}`)
+  }
+  try {
+    return { status: res.status, body: text ? JSON.parse(text) : {} }
+  } catch (e) {
+    throw new Error(`${method} ${urlPath} returned invalid JSON: ${e.message}`)
+  }
+}
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
+
 function basenameNoExt(file) {
   return String(file || '').replace(/\.tex$/i, '').split('/').pop()
 }
@@ -272,10 +303,184 @@ async function checkMessageRoundTrip() {
   }
 }
 
+let lastSpawnWakeProbeAt = 0
+let spawnWakeProbeInFlight = false
+
+function metadataOf(agent) {
+  const meta = agent?.metadata || {}
+  if (typeof meta === 'string') {
+    try {
+      return JSON.parse(meta)
+    } catch {
+      return {}
+    }
+  }
+  return meta && typeof meta === 'object' ? meta : {}
+}
+
+async function resolveAgent(agent) {
+  const result = await sendRequest({ type: 'resolve-agent', agent }, REQUEST_TIMEOUT_MS)
+  return result?.agent || null
+}
+
+async function readAgentSeat(agentId) {
+  const result = await fetchJsonMaybe(FLEET_SERVER, `/api/agent-seat?agent=${encodeURIComponent(agentId)}`, { okStatuses: [404] })
+  if (result.status === 404) return null
+  return result.body?.seat || null
+}
+
+async function waitForSpawnReady(agentId, deadline) {
+  let lastAgent = null
+  let lastSeat = null
+  while (Date.now() < deadline) {
+    lastAgent = await resolveAgent(agentId)
+    if (lastAgent && !lastAgent.dead && metadataOf(lastAgent).shell !== true) {
+      lastSeat = await readAgentSeat(agentId)
+      if (lastSeat?.session_id && lastSeat?.daemon_key && lastSeat?.terminal_capability) {
+        return { agent: lastAgent, seat: lastSeat }
+      }
+    }
+    await sleep(1000)
+  }
+  if (!lastAgent) throw new ProbeIndeterminateError(`spawn mailbox did not produce a roster row for ${agentId}`)
+  if (metadataOf(lastAgent).shell === true) throw new ProbeIndeterminateError(`spawn mailbox reserved ${agentId}, but the process never logged in`)
+  throw new ProbeIndeterminateError(`spawned agent ${agentId} logged in without a complete current durable seat`)
+}
+
+async function waitForControlTrace(traceId, predicate, deadline) {
+  let lastTrace = null
+  while (Date.now() < deadline) {
+    const data = await fetchJson(FLEET_SERVER, `/api/diagnostics/control-plane-traces?trace_id=${encodeURIComponent(traceId)}&limit=100`)
+    lastTrace = data?.trace || null
+    const events = Array.isArray(lastTrace?.events) ? lastTrace.events : []
+    const found = events.find(predicate)
+    if (found) return { trace: lastTrace, event: found }
+    await sleep(500)
+  }
+  const summary = Array.isArray(lastTrace?.events)
+    ? lastTrace.events.map(e => `${e.operation}:${e.status}${e.error ? `:${e.error}` : ''}`).join(', ')
+    : 'no retained trace'
+  throw new ProbeIndeterminateError(`wake trace ${traceId} did not reach a terminal outcome (${summary})`)
+}
+
+async function cleanupSpawnWakeProbe({ agentId, taskId }) {
+  if (taskId) {
+    try {
+      await sendRequest({ type: 'remove-task', task_id: taskId }, 5000)
+    } catch (e) {
+      console.error(`[dev-bot] disposable task cleanup failed for ${taskId}: ${e.message}`)
+    }
+  }
+  if (agentId) {
+    try {
+      await sendRequest({ type: 'kill-session', agent: agentId }, 10_000)
+    } catch (e) {
+      console.error(`[dev-bot] disposable session cleanup failed for ${agentId}: ${e.message}`)
+    }
+    try {
+      await sendRequest({ type: 'mark-dead', agent: agentId }, 5000)
+    } catch (e) {
+      console.error(`[dev-bot] disposable agent cleanup failed for ${agentId}: ${e.message}`)
+    }
+  }
+}
+
+async function checkSpawnWakeSeat() {
+  if (!SPAWN_WAKE_ENABLED) {
+    return { skipped: true, reason: 'disabled' }
+  }
+  if (spawnWakeProbeInFlight) {
+    return { skipped: true, reason: 'previous probe still in flight' }
+  }
+  const now = Date.now()
+  if (lastSpawnWakeProbeAt && now - lastSpawnWakeProbeAt < SPAWN_WAKE_INTERVAL_MS) {
+    return { skipped: true, reason: 'cadence', nextAt: new Date(lastSpawnWakeProbeAt + SPAWN_WAKE_INTERVAL_MS).toISOString() }
+  }
+
+  spawnWakeProbeInFlight = true
+  lastSpawnWakeProbeAt = now
+  let agentId = null
+  let taskId = null
+  const deadline = now + SPAWN_WAKE_TIMEOUT_MS
+  const suffix = randomUUID().slice(0, 8)
+  const name = `dev-probe-seat-${suffix}`
+  const terminalToken = `dev-terminal-probe:${randomUUID()}`
+  const wakeToken = `dev-wake-probe:${randomUUID()}`
+  try {
+    const spawn = await sendRequest({
+      type: 'spawn',
+      fresh: true,
+      name,
+      cwd: REPO_ROOT,
+      mailboxTarget: AGENT_ID,
+      ...(SPAWN_WAKE_MODEL ? { model: SPAWN_WAKE_MODEL } : {}),
+    }, REQUEST_TIMEOUT_MS)
+    if (!spawn?.ok || spawn.status !== 'pending' || !spawn.agent_id || !spawn.mailbox_id) {
+      throw new ProbeIndeterminateError(`spawn did not return a pending mailbox with agent_id (${JSON.stringify(spawn)})`)
+    }
+    agentId = spawn.agent_id
+
+    const { seat } = await waitForSpawnReady(agentId, deadline)
+    const alive = await sendRequest({ type: 'check-alive', agent: agentId }, REQUEST_TIMEOUT_MS)
+    if (alive?.state !== 'alive') {
+      throw new Error(`spawned agent ${agentId} is not alive after seat binding (state=${alive?.state || 'unknown'} reason=${alive?.reason || 'none'})`)
+    }
+
+    await sendRequest({ type: 'send-text', agent: agentId, text: terminalToken, enter: false }, REQUEST_TIMEOUT_MS)
+    const capture = await sendRequest({ type: 'capture-pane', agent: agentId, lines: 20 }, REQUEST_TIMEOUT_MS)
+    if (!String(capture?.content || '').includes(terminalToken)) {
+      throw new Error(`terminal route for ${agentId} accepted send-text but capture-pane did not show the probe token`)
+    }
+
+    const delegate = await sendRequest({
+      type: 'delegate',
+      from: AGENT_ID,
+      agent: agentId,
+      description: `dev bot wake probe ${suffix}`,
+      message: wakeToken,
+      operation_id: `dev-bot-spawn-wake:${suffix}`,
+    }, REQUEST_TIMEOUT_MS)
+    taskId = delegate?.task_id || null
+    if (!delegate?.ok || !delegate.trace_id || !taskId) {
+      throw new ProbeIndeterminateError(`delegate wake did not return task and trace evidence (${JSON.stringify(delegate)})`)
+    }
+    const trace = await waitForControlTrace(delegate.trace_id, event => {
+      if (event.operation === 'wake.noop' && event.status === 'already-awake') return true
+      if (event.operation === 'wake.respawn' && event.status === 'sent') return true
+      if (event.operation === 'wake.error' || event.status === 'failed') return true
+      return false
+    }, deadline)
+    if (trace.event.operation === 'wake.error' || trace.event.status === 'failed') {
+      throw new Error(`wake routing failed for ${agentId}: ${trace.event.error || JSON.stringify(trace.event.detail || {})}`)
+    }
+
+    const inbox = await sendRequest({ type: 'my-task', agent: agentId }, REQUEST_TIMEOUT_MS)
+    const sawTask = inbox?.task?.id === taskId || (Array.isArray(inbox?.tasks) && inbox.tasks.some(task => task.id === taskId))
+    const sawMessage = Array.isArray(inbox?.messages) && inbox.messages.some(message => message.task_id === taskId || message.text === wakeToken)
+    if (!sawTask || !sawMessage) {
+      throw new Error(`spawned agent inbox did not contain delegated wake task/message for ${agentId}`)
+    }
+
+    return {
+      agentId,
+      mailboxId: spawn.mailbox_id,
+      seat: {
+        sessionId: seat.session_id,
+        daemonKey: seat.daemon_key,
+      },
+      wake: trace.event.status,
+      taskId,
+    }
+  } finally {
+    await cleanupSpawnWakeProbe({ agentId, taskId })
+    spawnWakeProbeInFlight = false
+  }
+}
+
 function compactFailure(results) {
   return results
     .filter(r => !r.ok)
-    .map(r => `${r.name}: ${r.error}`)
+    .map(r => `${r.name}: ${r.indeterminate ? 'indeterminate: ' : ''}${r.error}`)
     .join('\n')
 }
 
@@ -284,11 +489,23 @@ async function runChecks() {
   for (const [name, check] of [
     ['doc-load', checkDocumentLoads],
     ['chat-roundtrip', checkMessageRoundTrip],
+    ['spawn-wake-seat', checkSpawnWakeSeat],
   ]) {
     try {
-      results.push({ name, ok: true, detail: await check() })
+      const detail = await check()
+      if (detail?.skipped) {
+        results.push({ name, ok: true, skipped: true, detail })
+      } else {
+        results.push({ name, ok: true, detail })
+      }
     } catch (e) {
-      results.push({ name, ok: false, setup: e instanceof ProbeSetupError, error: e?.message || String(e) })
+      results.push({
+        name,
+        ok: false,
+        setup: e instanceof ProbeSetupError,
+        indeterminate: e instanceof ProbeIndeterminateError,
+        error: e?.message || String(e),
+      })
     }
   }
   const failures = results.filter(r => !r.ok)
@@ -358,7 +575,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'v1 coverage: server health through real doc SVG asset load; disposable identity chat round trip. Create/spawn/wake/mint/seat is not covered in v1.',
+    'Coverage: server health through real doc SVG asset load; disposable identity chat round trip; lower-cadence live spawn/wake/seat probe.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)
@@ -376,7 +593,10 @@ async function sweep() {
     if (report.ok) {
       if (lastFailureKey) writeHeartbeat('recovered')
       lastFailureKey = null
-      writeHeartbeat('healthy', { checks: report.results.map(r => r.name) })
+      writeHeartbeat('healthy', {
+        checks: report.results.filter(r => !r.skipped).map(r => r.name),
+        skipped: report.results.filter(r => r.skipped).map(r => `${r.name}:${r.detail?.reason || 'skipped'}`),
+      })
       return
     }
     if (report.setupOnly) {
