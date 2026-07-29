@@ -6,6 +6,9 @@
   "bin": {
     "dev-bot": "./dev-bot.mjs"
   },
+  "scripts": {
+    "test": "node --test"
+  },
   "dependencies": {
     "@tlda/bot": "file:../../tlda/packages/bot",
     "ws": "^8.0.0"

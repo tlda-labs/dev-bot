@@ -3,8 +3,8 @@
  * dev bot — testing-environment noticer.
  *
  * Watches the testing fleet/store surface with real behavioral probes. Healthy
- * testing stays silent; failures nudge dev agents in fleet chat. This bot never
- * enumerates or kills processes.
+ * testing stays silent; failures nudge dev agents in fleet chat. It also runs
+ * the existing dev-resource reaper and retires idle managed Playwright pools.
  */
 
 import WebSocket from 'ws'
@@ -23,6 +23,8 @@ import {
 } from '@tlda/bot'
 import { labelsForAgent } from '@tlda/bot'
 import { startWsRequest } from '@tlda/bot'
+import { createDevReaper } from '../../tlda/agent-runtime/dev-reaper.mjs'
+import { createPlaywrightPoolCleanup } from './resource-cleanup.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -60,6 +62,7 @@ const NUDGE_TO_OVERRIDE = process.env.TLDA_DEV_BOT_NUDGE_TO || ''
 const NUDGE_LABEL = (process.env.TLDA_DEV_BOT_NUDGE_LABEL || 'on-call').trim()
 const NUDGE_ON_SETUP = process.env.TLDA_DEV_BOT_NUDGE_SETUP === '1'
 const NUDGE_DRY_RUN = process.env.TLDA_DEV_BOT_NUDGE_DRY_RUN === '1'
+const RESOURCE_CLEANUP_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS || '', 10) || 60_000
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
   throw new Error(`dev bot only probes configured environments ${JSON.stringify(ALLOWED_ENVIRONMENTS)}; active config is "${CONFIG_NAME}"`)
@@ -99,6 +102,10 @@ let sweepTimer = null
 let sweepInFlight = false
 let lastFailureKey = null
 let lastFailureNudgeAt = 0
+const devReaper = createDevReaper({ machineId: MACHINE_ID, envName: CONFIG_NAME })
+const playwrightPoolCleanup = createPlaywrightPoolCleanup()
+let resourceCleanupTimer = null
+let resourceCleanupInFlight = false
 
 class ProbeSetupError extends Error {
   constructor(message) {
@@ -561,6 +568,23 @@ async function sweep() {
   }
 }
 
+async function cleanupResources() {
+  if (resourceCleanupInFlight) return
+  resourceCleanupInFlight = true
+  try {
+    const results = await playwrightPoolCleanup.sweep()
+    for (const result of results) {
+      if (result.state === 'reaped') {
+        console.log(`[dev-bot] reaped empty Playwright session "${result.session}" after ${Math.round(result.idleMs / 60_000)}m`)
+      } else if (result.state === 'error') {
+        console.error(`[dev-bot] Playwright cleanup failed for "${result.session}": ${result.error}`)
+      }
+    }
+  } finally {
+    resourceCleanupInFlight = false
+  }
+}
+
 function connect() {
   ws = new WebSocket(WS_URL, { rejectUnauthorized: false })
   ws.on('open', async () => {
@@ -627,6 +651,10 @@ try {
 }
 
 writeHeartbeat('startup', { intervalMs: INTERVAL_MS })
+resourceCleanupTimer = setInterval(() => cleanupResources().catch(e => console.error('[dev-bot] resource cleanup failed:', e.message)), RESOURCE_CLEANUP_INTERVAL_MS)
+resourceCleanupTimer.unref?.()
+cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
+devReaper.start()
 connect()
 
 process.on('SIGINT', () => {
