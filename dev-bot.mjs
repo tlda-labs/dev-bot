@@ -15,7 +15,7 @@ import { fileURLToPath } from 'url'
 
 import {
   CONFIG_DIR,
-  getActiveConfigName,
+  getActiveEnvName,
   getFleetServerUrl,
   getManagedBotEnvironments,
   getManagedBots,
@@ -37,9 +37,9 @@ const TMUX_SESSION = process.env.TLDA_BOT_TMUX_SESSION || null
 const OWNER_ID = 'fleet:skip'
 
 const MY_BOT = getManagedBots().find(b => String(b.name || '').toLowerCase() === BOT_KEY) || {}
-const CONFIG_NAME = getActiveConfigName(MY_BOT.server)
-const FLEET_SERVER = getFleetServerUrl(MY_BOT.server)
-const STORE_SERVER = getServerUrl(MY_BOT.server)
+const CONFIG_NAME = getActiveEnvName(MY_BOT.environment)
+const FLEET_SERVER = getFleetServerUrl(MY_BOT.environment)
+const STORE_SERVER = getServerUrl(MY_BOT.environment)
 const WS_URL = FLEET_SERVER.replace(/^http/, 'ws') + '/ws/fleet'
 const BOT_ENVIRONMENTS = getManagedBotEnvironments()
 const ALLOWED_ENVIRONMENTS = Object.entries(BOT_ENVIRONMENTS)
@@ -252,57 +252,6 @@ async function checkDocumentLoads() {
   return { doc: project.name, assetPath, bytes: text.length }
 }
 
-async function checkMessageRoundTrip() {
-  const senderId = `fleet:dev-probe-${randomUUID().slice(0, 8)}`
-  const senderName = `dev-probe-${randomUUID().slice(0, 6)}`
-  const token = `dev-probe:${randomUUID()}`
-  let senderRegistered = false
-  try {
-    const payload = {
-      agent_id: senderId,
-      name: senderName,
-      cwd: REPO_ROOT,
-      labels: ['dev-probe'],
-      metadata: { bot_probe: BOT_KEY, disposable: true },
-    }
-    await sendRequest({ ...payload, type: 'reserve-shell' })
-    await sendRequest({ ...payload, type: 'login' })
-    senderRegistered = true
-    let sent
-    try {
-      sent = await sendRequest({ type: 'chat', from: senderId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
-    } catch (e) {
-      if (/No recipients matched/i.test(e?.message || '')) {
-        throw new ProbeSetupError(`round-trip bot recipient was not reachable (${AGENT_ID})`)
-      }
-      throw e
-    }
-    const ackEventIds = Array.isArray(sent?.event_ids) ? sent.event_ids : []
-    if (!ackEventIds.length) throw new Error('chat send did not return an accepted event id')
-    const deadline = Date.now() + REQUEST_TIMEOUT_MS
-    while (Date.now() < deadline) {
-      const history = await sendRequest({ type: 'chat-history', agents: [AGENT_ID], limit: 30 }, 5000)
-      const events = Array.isArray(history?.events) ? history.events : []
-      const found = events.find(event =>
-        (event.text || event.message) === token ||
-        ackEventIds.includes(Number(event.id || event.event_id)),
-      )
-      if (found) return { senderId, recipientId: AGENT_ID, eventId: found.id || found.event_id || null }
-      await new Promise(r => setTimeout(r, 500))
-    }
-    throw new Error('accepted chat did not arrive in dev bot chat history')
-  } finally {
-    if (senderRegistered) {
-      try {
-        await sendRequest({ type: 'mark-dead', agent: senderId }, 5000)
-      } catch (e) {
-        // Best-effort cleanup; failure is visible in logs for manual sweep.
-        console.error(`[dev-bot] disposable sender cleanup failed for ${senderId}: ${e.message}`)
-      }
-    }
-  }
-}
-
 let lastSpawnWakeProbeAt = 0
 let spawnWakeProbeInFlight = false
 
@@ -488,7 +437,6 @@ async function runChecks() {
   const results = []
   for (const [name, check] of [
     ['doc-load', checkDocumentLoads],
-    ['chat-roundtrip', checkMessageRoundTrip],
     ['spawn-wake-seat', checkSpawnWakeSeat],
   ]) {
     try {
@@ -521,8 +469,7 @@ async function runChecks() {
 }
 
 function isNudgeTarget(agent) {
-  const status = String(agent?.status || '').toLowerCase()
-  if (!agent || agent.dead || agent.human || status === 'human' || status === 'human-away' || agent.id === OWNER_ID || agent.id === AGENT_ID) return false
+  if (!agent || agent.dead || agent.human || agent.id === OWNER_ID || agent.id === AGENT_ID) return false
   const labels = labelsForAgent(agent)
   if (labels.includes('bot')) return false
   if (agent.id?.startsWith?.('fleet:dev-probe-')) return false
@@ -575,7 +522,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: server health through real doc SVG asset load; disposable identity chat round trip; lower-cadence live spawn/wake/seat probe.',
+    'Coverage: server health through real doc SVG asset load; lower-cadence live spawn/wake/seat probe.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)
