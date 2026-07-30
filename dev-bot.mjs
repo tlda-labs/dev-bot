@@ -23,7 +23,6 @@ import {
 } from '@tlda/bot'
 import { labelsForAgent } from '@tlda/bot'
 import { startWsRequest } from '@tlda/bot'
-import { createDevReaper } from '../../tlda/agent-runtime/dev-reaper.mjs'
 import { createPlaywrightPoolCleanup } from './resource-cleanup.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -102,7 +101,6 @@ let sweepTimer = null
 let sweepInFlight = false
 let lastFailureKey = null
 let lastFailureNudgeAt = 0
-const devReaper = createDevReaper({ machineId: MACHINE_ID, envName: CONFIG_NAME })
 const playwrightPoolCleanup = createPlaywrightPoolCleanup()
 let resourceCleanupTimer = null
 let resourceCleanupInFlight = false
@@ -654,7 +652,6 @@ writeHeartbeat('startup', { intervalMs: INTERVAL_MS })
 resourceCleanupTimer = setInterval(() => cleanupResources().catch(e => console.error('[dev-bot] resource cleanup failed:', e.message)), RESOURCE_CLEANUP_INTERVAL_MS)
 resourceCleanupTimer.unref?.()
 cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
-devReaper.start()
 connect()
 
 process.on('SIGINT', () => {
