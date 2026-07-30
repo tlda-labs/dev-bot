@@ -23,7 +23,7 @@ import {
 } from '@tlda/bot'
 import { labelsForAgent } from '@tlda/bot'
 import { startWsRequest } from '@tlda/bot'
-import { createPlaywrightPoolCleanup } from './resource-cleanup.mjs'
+import { createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const REPO_ROOT = path.resolve(__dirname, '..')
@@ -62,6 +62,7 @@ const NUDGE_LABEL = (process.env.TLDA_DEV_BOT_NUDGE_LABEL || 'on-call').trim()
 const NUDGE_ON_SETUP = process.env.TLDA_DEV_BOT_NUDGE_SETUP === '1'
 const NUDGE_DRY_RUN = process.env.TLDA_DEV_BOT_NUDGE_DRY_RUN === '1'
 const RESOURCE_CLEANUP_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS || '', 10) || 60_000
+const WORKTREE_CLEANUP_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS || '', 10) || 60 * 60_000
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
   throw new Error(`dev bot only probes configured environments ${JSON.stringify(ALLOWED_ENVIRONMENTS)}; active config is "${CONFIG_NAME}"`)
@@ -102,8 +103,10 @@ let sweepInFlight = false
 let lastFailureKey = null
 let lastFailureNudgeAt = 0
 const playwrightPoolCleanup = createPlaywrightPoolCleanup()
+const worktreeCleanup = createWorktreeCleanup()
 let resourceCleanupTimer = null
 let resourceCleanupInFlight = false
+let lastWorktreeCleanupAt = 0
 
 class ProbeSetupError extends Error {
   constructor(message) {
@@ -576,6 +579,19 @@ async function cleanupResources() {
         console.log(`[dev-bot] reaped empty Playwright session "${result.session}" after ${Math.round(result.idleMs / 60_000)}m`)
       } else if (result.state === 'error') {
         console.error(`[dev-bot] Playwright cleanup failed for "${result.session}": ${result.error}`)
+      }
+    }
+    if (Date.now() - lastWorktreeCleanupAt >= WORKTREE_CLEANUP_INTERVAL_MS) {
+      const worktrees = await worktreeCleanup.sweep()
+      lastWorktreeCleanupAt = Date.now()
+      for (const entry of worktrees.removedWorktrees) {
+        console.log(`[dev-bot] removed merged clean worktree "${entry.path}"`)
+      }
+      for (const entry of worktrees.evicted) {
+        console.log(`[dev-bot] evicted worktree node_modules "${entry.nodeModules}" (${entry.sizeBytes} bytes)`)
+      }
+      for (const entry of worktrees.abandoned) {
+        console.error(`[dev-bot] preserved abandoned worktree-shaped directory "${entry.path}": ${entry.error}`)
       }
     }
   } finally {
