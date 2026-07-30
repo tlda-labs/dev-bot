@@ -7,7 +7,6 @@
  * the existing dev-resource reaper and retires idle managed Playwright pools.
  */
 
-import WebSocket from 'ws'
 import fs from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
@@ -15,14 +14,17 @@ import { fileURLToPath } from 'url'
 
 import {
   CONFIG_DIR,
+  configTypes,
+  createBot,
+  defineConfig,
   getActiveEnvName,
   getFleetServerUrl,
   getManagedBotEnvironments,
   getManagedBots,
   getServerUrl,
+  parseConfig,
 } from '@tlda/bot'
 import { labelsForAgent } from '@tlda/bot'
-import { startWsRequest } from '@tlda/bot'
 import { createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -33,36 +35,46 @@ const AGENT_NAME = BOT_KEY
 const PID_FILE = process.env.TLDA_BOT_PIDFILE || path.join(CONFIG_DIR, `${BOT_KEY}.pid`)
 const HEARTBEAT_FILE = process.env.TLDA_BOT_HEARTBEAT || path.join(CONFIG_DIR, `${BOT_KEY}.heartbeat`)
 const ID_FILE = process.env.TLDA_BOT_IDFILE || path.join(CONFIG_DIR, `${BOT_KEY}.fleet-id`)
-const MACHINE_ID = process.env.TLDA_BOT_MACHINE_ID || null
-const TMUX_SESSION = process.env.TLDA_BOT_TMUX_SESSION || null
 const OWNER_ID = 'fleet:skip'
 
 const MY_BOT = getManagedBots().find(b => String(b.name || '').toLowerCase() === BOT_KEY) || {}
 const CONFIG_NAME = getActiveEnvName(MY_BOT.environment)
 const FLEET_SERVER = getFleetServerUrl(MY_BOT.environment)
 const STORE_SERVER = getServerUrl(MY_BOT.environment)
-const WS_URL = FLEET_SERVER.replace(/^http/, 'ws') + '/ws/fleet'
 const BOT_ENVIRONMENTS = getManagedBotEnvironments()
 const ALLOWED_ENVIRONMENTS = Object.entries(BOT_ENVIRONMENTS)
   .filter(([, members]) => members.some(member => String(member).toLowerCase() === BOT_KEY))
   .map(([envName]) => envName)
 
-const INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_INTERVAL_MS || '', 10) || 60_000
-const FAILURE_COOLDOWN_MS = parseInt(process.env.TLDA_DEV_BOT_FAILURE_COOLDOWN_MS || '', 10) || 5 * 60_000
-const REQUEST_TIMEOUT_MS = parseInt(process.env.TLDA_DEV_BOT_REQUEST_TIMEOUT_MS || '', 10) || 15_000
-const SPAWN_WAKE_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS || '', 10) || 30 * 60_000
-const SPAWN_WAKE_TIMEOUT_MS = parseInt(process.env.TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS || '', 10) || 3 * 60_000
-const SPAWN_WAKE_ENABLED = process.env.TLDA_DEV_BOT_SPAWN_WAKE_ENABLED !== '0'
-const SPAWN_WAKE_MODEL = process.env.TLDA_DEV_BOT_SPAWN_WAKE_MODEL || ''
-const PROBE_DOC = process.env.TLDA_DEV_BOT_DOC || ''
-const ASSET_PATH_OVERRIDE = process.env.TLDA_DEV_BOT_ASSET_PATH_OVERRIDE || ''
-const ALLOW_NONDEFAULT = process.env.TLDA_DEV_BOT_ALLOW_NONDEFAULT === '1'
-const NUDGE_TO_OVERRIDE = process.env.TLDA_DEV_BOT_NUDGE_TO || ''
-const NUDGE_LABEL = (process.env.TLDA_DEV_BOT_NUDGE_LABEL || 'on-call').trim()
-const NUDGE_ON_SETUP = process.env.TLDA_DEV_BOT_NUDGE_SETUP === '1'
-const NUDGE_DRY_RUN = process.env.TLDA_DEV_BOT_NUDGE_DRY_RUN === '1'
-const RESOURCE_CLEANUP_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS || '', 10) || 60_000
-const WORKTREE_CLEANUP_INTERVAL_MS = parseInt(process.env.TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS || '', 10) || 60 * 60_000
+const positive = value => value > 0
+export const configSchema = defineConfig({
+  intervalMs: { env: 'TLDA_DEV_BOT_INTERVAL_MS', default: 60_000, description: 'Behavioral probe interval in milliseconds.', parse: configTypes.integer, validate: positive },
+  failureCooldownMs: { env: 'TLDA_DEV_BOT_FAILURE_COOLDOWN_MS', default: 300_000, description: 'Minimum interval between identical failure notices.', parse: configTypes.integer, validate: positive },
+  requestTimeoutMs: { env: 'TLDA_DEV_BOT_REQUEST_TIMEOUT_MS', default: 15_000, description: 'Fleet and HTTP request timeout in milliseconds.', parse: configTypes.integer, validate: positive },
+  spawnWakeIntervalMs: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS', default: 1_800_000, description: 'Spawn/wake probe cadence in milliseconds.', parse: configTypes.integer, validate: positive },
+  spawnWakeTimeoutMs: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS', default: 180_000, description: 'Overall spawn/wake probe deadline.', parse: configTypes.integer, validate: positive },
+  spawnWakeEnabled: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_ENABLED', default: true, description: 'Whether the destructive disposable-agent probe runs.', parse: configTypes.boolean },
+  spawnWakeModel: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_MODEL', default: '', description: 'Optional model override for the disposable probe agent.', parse: configTypes.string },
+  probeDoc: { env: 'TLDA_DEV_BOT_DOC', default: '', description: 'Optional project selected for the SVG load probe.', parse: configTypes.string },
+  assetPathOverride: { env: 'TLDA_DEV_BOT_ASSET_PATH_OVERRIDE', default: '', description: 'Optional exact SVG asset path for the document probe.', parse: configTypes.string },
+  allowNondefault: { env: 'TLDA_DEV_BOT_ALLOW_NONDEFAULT', default: false, description: 'Permit probing an environment not assigned to this bot.', parse: configTypes.boolean },
+  nudgeTo: { env: 'TLDA_DEV_BOT_NUDGE_TO', default: '', description: 'Exact failure-notice recipient override.', parse: configTypes.string },
+  nudgeLabel: { env: 'TLDA_DEV_BOT_NUDGE_LABEL', default: 'on-call', description: 'Fleet label used to select failure-notice recipients.', parse: configTypes.string },
+  nudgeOnSetup: { env: 'TLDA_DEV_BOT_NUDGE_SETUP', default: false, description: 'Send notices for probe setup failures.', parse: configTypes.boolean },
+  nudgeDryRun: { env: 'TLDA_DEV_BOT_NUDGE_DRY_RUN', default: false, description: 'Record but do not send failure notices.', parse: configTypes.boolean },
+  resourceCleanupIntervalMs: { env: 'TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS', default: 60_000, description: 'Playwright cleanup cadence.', parse: configTypes.integer, validate: positive },
+  worktreeCleanupIntervalMs: { env: 'TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS', default: 3_600_000, description: 'Worktree cleanup cadence.', parse: configTypes.integer, validate: positive },
+  statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
+})
+const config = parseConfig(configSchema)
+const {
+  intervalMs: INTERVAL_MS, failureCooldownMs: FAILURE_COOLDOWN_MS, requestTimeoutMs: REQUEST_TIMEOUT_MS,
+  spawnWakeIntervalMs: SPAWN_WAKE_INTERVAL_MS, spawnWakeTimeoutMs: SPAWN_WAKE_TIMEOUT_MS,
+  spawnWakeEnabled: SPAWN_WAKE_ENABLED, spawnWakeModel: SPAWN_WAKE_MODEL, probeDoc: PROBE_DOC,
+  assetPathOverride: ASSET_PATH_OVERRIDE, allowNondefault: ALLOW_NONDEFAULT, nudgeTo: NUDGE_TO_OVERRIDE,
+  nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
+  resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
+} = config
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
   throw new Error(`dev bot only probes configured environments ${JSON.stringify(ALLOWED_ENVIRONMENTS)}; active config is "${CONFIG_NAME}"`)
@@ -73,31 +85,8 @@ for (const url of [FLEET_SERVER, STORE_SERVER]) {
   }
 }
 
-function loadOrCreateFleetId() {
-  try {
-    const existing = fs.readFileSync(ID_FILE, 'utf8').trim()
-    if (existing) return existing
-  } catch (e) {
-    if (e?.code !== 'ENOENT') throw e
-  }
-  const id = `fleet:${BOT_KEY}`
-  try {
-    fs.mkdirSync(path.dirname(ID_FILE), { recursive: true })
-    fs.writeFileSync(ID_FILE, id)
-  } catch (e) {
-    // Best-effort persistence; deterministic id remains usable for this run.
-    console.error(`[dev-bot] could not persist fleet id ${ID_FILE}: ${e.message}`)
-  }
-  return id
-}
-
-const AGENT_ID = loadOrCreateFleetId()
-let assignedName = null
-let ws = null
-let reconnectTimer = null
-let reconnectDelay = 500
-let msgId = 1
-const pendingRequests = new Map()
+const AGENT_ID = `fleet:${BOT_KEY}`
+let bot = null
 let sweepTimer = null
 let sweepInFlight = false
 let lastFailureKey = null
@@ -107,6 +96,7 @@ const worktreeCleanup = createWorktreeCleanup()
 let resourceCleanupTimer = null
 let resourceCleanupInFlight = false
 let lastWorktreeCleanupAt = 0
+const statusSamples = []
 
 class ProbeSetupError extends Error {
   constructor(message) {
@@ -140,56 +130,8 @@ function writeHeartbeat(reason, detail = {}) {
   }
 }
 
-function isCanonicalBot() {
-  return assignedName === AGENT_NAME
-}
-
-function sendRequestOn(socketRef, pending, msg, timeoutMs = REQUEST_TIMEOUT_MS) {
-  const id = msgId++
-  return startWsRequest({
-    pending,
-    id,
-    type: msg?.type || 'unknown',
-    deadlineMs: timeoutMs,
-    makeDeadlineError: () => new Error(`${msg?.type || 'ws request'} timed out after ${timeoutMs}ms`),
-    makeSendError: () => new Error('ws not connected'),
-    send: () => {
-      const socket = socketRef()
-      if (socket?.readyState !== WebSocket.OPEN) return false
-      socket.send(JSON.stringify({ id, ...msg }))
-      return true
-    },
-  })
-}
-
 function sendRequest(msg, timeoutMs = REQUEST_TIMEOUT_MS) {
-  return sendRequestOn(() => ws, pendingRequests, msg, timeoutMs)
-}
-
-function handleWsReply(msg, pending = pendingRequests) {
-  if (msg.id == null || !pending.has(msg.id)) return false
-  const p = pending.get(msg.id)
-  pending.delete(msg.id)
-  if (msg.error) p.reject(new Error(typeof msg.error === 'string' ? msg.error : (msg.error.message || JSON.stringify(msg.error))))
-  else p.resolve(msg.result)
-  return true
-}
-
-async function loginFleet() {
-  const payload = {
-    agent_id: AGENT_ID,
-    name: AGENT_NAME,
-    cwd: REPO_ROOT,
-    labels: ['bot', BOT_KEY],
-    machine_id: MACHINE_ID || undefined,
-    tmux_session: TMUX_SESSION || undefined,
-    metadata: { bot: BOT_KEY, pid: process.pid, config: CONFIG_NAME },
-  }
-  await sendRequest({ ...payload, type: 'reserve-shell' })
-  const result = await sendRequest({ ...payload, type: 'login' })
-  assignedName = result?.agent?.friendly_name || result?.assigned_name || null
-  if (!isCanonicalBot()) console.log(`[dev-bot] inert: requested "${AGENT_NAME}", assigned "${assignedName || '(none)'}"`)
-  return result
+  return bot.request(msg, timeoutMs)
 }
 
 async function fetchJson(base, urlPath, { method = 'GET', body = undefined } = {}) {
@@ -494,7 +436,7 @@ async function nudgeTargets() {
 }
 
 async function sendChat(to, message) {
-  if (!isCanonicalBot()) return null
+  if (!bot.isCanonical()) return null
   return sendRequest({
     type: 'chat',
     from: AGENT_ID,
@@ -541,7 +483,7 @@ async function sendFailureNudge(report) {
 }
 
 async function sweep() {
-  if (sweepInFlight || !isCanonicalBot()) return
+  if (sweepInFlight || !bot.isCanonical()) return
   sweepInFlight = true
   try {
     const report = await runChecks()
@@ -570,7 +512,7 @@ async function sweep() {
 }
 
 async function cleanupResources() {
-  if (resourceCleanupInFlight) return
+  if (resourceCleanupInFlight || !bot?.isCanonical()) return
   resourceCleanupInFlight = true
   try {
     const results = await playwrightPoolCleanup.sweep()
@@ -584,6 +526,17 @@ async function cleanupResources() {
     if (Date.now() - lastWorktreeCleanupAt >= WORKTREE_CLEANUP_INTERVAL_MS) {
       const worktrees = await worktreeCleanup.sweep()
       lastWorktreeCleanupAt = Date.now()
+      statusSamples.push({
+        ts: new Date().toISOString(),
+        totalBytes: worktrees.totalBytes,
+        retainedBytes: worktrees.retainedBytes,
+        overBudgetBytes: worktrees.overBudgetBytes,
+        removedWorktrees: worktrees.removedWorktrees.length,
+        evictedCaches: worktrees.evicted.length,
+        pinnedWorktrees: worktrees.pinned.length,
+        abandonedWorktrees: worktrees.abandoned.length,
+      })
+      if (statusSamples.length > 168) statusSamples.splice(0, statusSamples.length - 168)
       for (const entry of worktrees.removedWorktrees) {
         console.log(`[dev-bot] removed merged clean worktree "${entry.path}"`)
       }
@@ -593,95 +546,109 @@ async function cleanupResources() {
       for (const entry of worktrees.abandoned) {
         console.error(`[dev-bot] preserved abandoned worktree-shaped directory "${entry.path}": ${entry.error}`)
       }
+      if (bot.isCanonical()) {
+        await publishStatus().catch(error => console.error(`[dev-bot] status publish failed: ${error.message}`))
+      }
     }
   } finally {
     resourceCleanupInFlight = false
   }
 }
 
-function connect() {
-  ws = new WebSocket(WS_URL, { rejectUnauthorized: false })
-  ws.on('open', async () => {
-    try {
-      console.log(`[dev-bot] connected to ${WS_URL}`)
-      reconnectDelay = 500
-      await loginFleet()
-      writeHeartbeat('ws-open')
-      if (sweepTimer) clearInterval(sweepTimer)
-      sweepTimer = setInterval(() => sweep().catch(e => console.error('[dev-bot] sweep failed:', e.message)), INTERVAL_MS)
-      sweep().catch(e => console.error('[dev-bot] initial sweep failed:', e.message))
-    } catch (e) {
-      console.error('[dev-bot] login failed:', e.message)
-      try {
-        ws.close()
-      } catch (closeError) {
-        // Best-effort reconnect trigger; login error remains the primary fault.
-        console.error(`[dev-bot] ws close after failed login failed: ${closeError.message}`)
-      }
-    }
+function formatBytes(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`
+  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
+}
+
+export function renderStatusMarkdown(samples = statusSamples) {
+  const generatedAt = new Date().toISOString()
+  const latest = samples.at(-1)
+  const findings = latest
+    ? `The latest sweep retained ${formatBytes(latest.retainedBytes)} across idle worktree dependency caches. ${latest.removedWorktrees} merged clean worktree(s) and ${latest.evictedCaches} cache(s) were removed in that sweep.`
+    : 'No completed worktree measurement is available yet.'
+  const width = 720
+  const height = 220
+  const max = Math.max(1, ...samples.map(sample => sample.totalBytes))
+  const points = samples.map((sample, index) => {
+    const x = samples.length <= 1 ? width / 2 : 30 + index * (width - 60) / (samples.length - 1)
+    const y = height - 25 - sample.totalBytes / max * (height - 50)
+    return { ...sample, x: x.toFixed(1), y: y.toFixed(1) }
   })
-  ws.on('message', raw => {
-    try {
-      handleWsReply(JSON.parse(raw.toString()))
-    } catch (e) {
-      // Best-effort parser guard; malformed frames are not request replies.
-      console.error(`[dev-bot] ignored malformed ws message: ${e.message}`)
-    }
-  })
-  ws.on('close', () => scheduleReconnect())
-  ws.on('error', e => console.error('[dev-bot] ws error:', e.message))
+  const polyline = points.map(point => `${point.x},${point.y}`).join(' ')
+  const chart = `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Worktree dependency disk use over time" style="max-width:100%;background:#fafafa;border:1px solid #ddd">
+  <polyline fill="none" stroke="#2563eb" stroke-width="3" points="${polyline}"/>
+  ${points.map(point => `<circle cx="${point.x}" cy="${point.y}" r="5" fill="#2563eb" tabindex="0"><title>${point.ts}: ${formatBytes(point.totalBytes)}</title></circle>`).join('\n  ')}
+</svg>`
+  return [
+    '# Dev bot disk and worktree status {.volatile}',
+    '',
+    findings,
+    '',
+    `Generated: ${generatedAt}`,
+    '',
+    'Provenance: dev bot worktree cleanup measurements from `git worktree`, `lsof`, and `du`; values are recorded after each completed worktree cleanup sweep.',
+    '',
+    '## Measurements',
+    '',
+    '| Timestamp | Total caches | Retained caches | Over budget | Removed worktrees | Evicted caches | Pinned | Abandoned |',
+    '|---|---:|---:|---:|---:|---:|---:|---:|',
+    ...samples.map(sample => `| ${sample.ts} | ${formatBytes(sample.totalBytes)} | ${formatBytes(sample.retainedBytes)} | ${formatBytes(sample.overBudgetBytes)} | ${sample.removedWorktrees} | ${sample.evictedCaches} | ${sample.pinnedWorktrees} | ${sample.abandonedWorktrees} |`),
+    '',
+    '## Timeline',
+    '',
+    chart,
+    '',
+    '<details><summary>How to read the timeline</summary>Each point is one completed cleanup sweep. Hover or focus a point for its timestamp and measured total.</details>',
+  ].join('\n')
 }
 
-function scheduleReconnect() {
-  if (reconnectTimer) return
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null
-    connect()
-  }, reconnectDelay)
-  reconnectDelay = Math.min(reconnectDelay * 2, 5000)
+export async function publishStatus({ transport = bot, samples = statusSamples } = {}) {
+  const requestId = `dev-status:${randomUUID()}`
+  const result = await transport.sendAndWait({
+    type: 'source-change',
+    project: 'info',
+    files: [{ path: config.statusFile, content: renderStatusMarkdown(samples) }],
+    editedBy: AGENT_ID,
+    requestId,
+  }, message => message.type === 'source-change-result' && message.requestId === requestId, REQUEST_TIMEOUT_MS)
+  if (!result.ok) throw new Error(result.error || `source update failed (${result.status || result.httpStatus})`)
+  return `[Dev bot disk and worktree status](/docs/info/${encodeURIComponent(config.statusFile.replace(/\.md$/i, '.html'))})`
 }
 
-try {
-  const prev = parseInt(fs.readFileSync(PID_FILE, 'utf8').trim(), 10)
-  if (prev && prev !== process.pid) {
-    try {
-      process.kill(prev, 0)
-      console.error(`[dev-bot] already running pid=${prev}`)
-      process.exit(0)
-    } catch (e) {
-      if (e?.code !== 'ESRCH') throw e
-    }
-  }
-} catch (e) {
-  if (e?.code !== 'ENOENT') throw e
+export const commands = [{
+  name: 'status',
+  summary: 'Publish and return the current disk/worktree status report.',
+  help: 'Writes the current semantic Markdown report and interactive timeline to the ordinary info project through the normal source-change pipeline, then returns its project-file reference.',
+  examples: ['status'],
+  authorize: ({ from }) => from === OWNER_ID,
+  handler: async ({ reply }) => {
+    await reply(await publishStatus())
+  },
+}]
+
+if (process.env.TLDA_DEV_BOT_NO_START !== '1') {
+  bot = createBot({
+    name: AGENT_NAME,
+    labels: ['bot', BOT_KEY],
+    server: FLEET_SERVER,
+    cwd: REPO_ROOT,
+    metadata: { config: CONFIG_NAME },
+    fleetId: AGENT_ID,
+    bestEffortIdentity: true,
+    pidFile: PID_FILE,
+    idFile: ID_FILE,
+    commands,
+  }).onOpen(() => {
+    writeHeartbeat('ws-open')
+    if (sweepTimer) clearInterval(sweepTimer)
+    sweepTimer = setInterval(() => sweep().catch(e => console.error('[dev-bot] sweep failed:', e.message)), INTERVAL_MS)
+    sweep().catch(e => console.error('[dev-bot] initial sweep failed:', e.message))
+    cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
+  }).start()
+
+  writeHeartbeat('startup', { intervalMs: INTERVAL_MS })
+  resourceCleanupTimer = setInterval(() => cleanupResources().catch(e => console.error('[dev-bot] resource cleanup failed:', e.message)), RESOURCE_CLEANUP_INTERVAL_MS)
+  resourceCleanupTimer.unref?.()
 }
-
-try {
-  fs.mkdirSync(path.dirname(PID_FILE), { recursive: true })
-  fs.writeFileSync(PID_FILE, String(process.pid))
-} catch (e) {
-  // Best-effort singleton guard; launch supervisor still owns restarts.
-  console.error(`[dev-bot] pidfile write failed: ${e.message}`)
-}
-
-writeHeartbeat('startup', { intervalMs: INTERVAL_MS })
-resourceCleanupTimer = setInterval(() => cleanupResources().catch(e => console.error('[dev-bot] resource cleanup failed:', e.message)), RESOURCE_CLEANUP_INTERVAL_MS)
-resourceCleanupTimer.unref?.()
-cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
-connect()
-
-process.on('SIGINT', () => {
-  try {
-    fs.unlinkSync(PID_FILE)
-  } catch (e) {
-    if (e?.code !== 'ENOENT') console.error(`[dev-bot] pidfile cleanup failed: ${e.message}`)
-  }
-  process.exit(0)
-})
-process.on('exit', () => {
-  try {
-    fs.unlinkSync(PID_FILE)
-  } catch (e) {
-    if (e?.code !== 'ENOENT') console.error(`[dev-bot] pidfile cleanup failed: ${e.message}`)
-  }
-})

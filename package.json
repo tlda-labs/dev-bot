@@ -7,7 +7,9 @@
     "dev-bot": "./dev-bot.mjs"
   },
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "docs": "TLDA_DEV_BOT_NO_START=1 node generate-docs.mjs",
+    "docs:check": "TLDA_DEV_BOT_NO_START=1 node generate-docs.mjs --check"
   },
   "dependencies": {
     "@tlda/bot": "file:../../tlda/packages/bot",
