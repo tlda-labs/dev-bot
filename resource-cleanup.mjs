@@ -173,6 +173,11 @@ export function createPlaywrightPoolCleanup({
   baseSession = process.env.TLDA_PW_BASE_SESSION || 'shared',
   capacity = Math.max(1, parseInt(process.env.TLDA_PW_CAPACITY || '', 10) || 3),
   emptyIdleMs = parseInt(process.env.TLDA_DEV_BOT_PW_EMPTY_MS || '', 10) || 5 * 60_000,
+  // `playwright-cli list` measured at 11.6s / 13.1s / 15.3s on the Mini — and that
+  // is the run that reports "(no browsers)", so it is the command's own floor, not
+  // load. The previous 5s could never be met, so every pass errored and this half
+  // of the reaper never swept anything.
+  queryTimeoutMs = parseInt(process.env.TLDA_DEV_BOT_PW_QUERY_MS || '', 10) || 30_000,
   playwrightCli = process.env.PLAYWRIGHT_CLI_BIN || path.join(MAIN_REPO, 'node_modules/.bin/playwright-cli'),
   tldaDev = process.env.TLDA_DEV_BIN || path.join(MAIN_REPO, 'cli/tlda-dev.mjs'),
 } = {}) {
@@ -181,7 +186,7 @@ export function createPlaywrightPoolCleanup({
   async function sweepSession(session) {
     const env = { ...process.env, TLDA_PW_SESSION: session }
     const list = await run(playwrightCli, ['list'], {
-      timeout: 5000,
+      timeout: queryTimeoutMs,
       encoding: 'utf8',
       cwd: MAIN_REPO,
     })
@@ -192,7 +197,7 @@ export function createPlaywrightPoolCleanup({
 
     await run(tldaDev, ['pw', 'sweep'], { timeout: 20_000, encoding: 'utf8', env })
     const tabs = await run(playwrightCli, [`-s=${session}`, 'tab-list'], {
-      timeout: 5000,
+      timeout: queryTimeoutMs,
       encoding: 'utf8',
       cwd: MAIN_REPO,
     })
