@@ -71,6 +71,7 @@ export function createWorktreeCleanup({
     const removedWorktrees = []
     const pinned = []
     const abandoned = []
+    const unremovable = []
 
     for (const worktree of worktrees.filter(entry => entry.path !== main)) {
       if (isActive(worktree)) {
@@ -97,10 +98,20 @@ export function createWorktreeCleanup({
         if (error?.code === 1) continue
         throw error
       }
-      await run('git', ['-C', repoRoot, 'worktree', 'remove', worktree.path], {
-        timeout: 10 * 60_000,
-        encoding: 'utf8',
-      })
+      // A worktree git refuses to remove — one containing submodules, say — is a
+      // property of that worktree, not of the sweep. Letting it throw abandoned
+      // every later worktree and, because the caller only advances its clock
+      // after sweep() returns, retried the same doomed removal every minute and
+      // never published a status report.
+      try {
+        await run('git', ['-C', repoRoot, 'worktree', 'remove', worktree.path], {
+          timeout: 10 * 60_000,
+          encoding: 'utf8',
+        })
+      } catch (error) {
+        unremovable.push({ ...worktree, error: error?.stderr?.trim() || error?.message || String(error) })
+        continue
+      }
       removedWorktrees.push(worktree)
     }
 
@@ -135,6 +146,7 @@ export function createWorktreeCleanup({
       evicted,
       pinned,
       abandoned,
+      unremovable,
       removedWorktrees,
     }
   }

@@ -550,6 +550,9 @@ async function cleanupResources() {
       for (const entry of worktrees.abandoned) {
         console.error(`[dev-bot] preserved abandoned worktree-shaped directory "${entry.path}": ${entry.error}`)
       }
+      for (const entry of worktrees.unremovable) {
+        console.error(`[dev-bot] could not remove merged clean worktree "${entry.path}": ${entry.error}`)
+      }
       if (bot.isCanonical()) {
         await publishStatus().catch(error => console.error(`[dev-bot] status publish failed: ${error.message}`))
       }
