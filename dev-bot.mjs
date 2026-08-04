@@ -53,7 +53,7 @@ export const configSchema = defineConfig({
   requestTimeoutMs: { env: 'TLDA_DEV_BOT_REQUEST_TIMEOUT_MS', default: 15_000, description: 'Fleet and HTTP request timeout in milliseconds.', parse: configTypes.integer, validate: positive },
   spawnWakeIntervalMs: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS', default: 1_800_000, description: 'Spawn/wake probe cadence in milliseconds.', parse: configTypes.integer, validate: positive },
   spawnWakeTimeoutMs: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS', default: 180_000, description: 'Overall spawn/wake probe deadline.', parse: configTypes.integer, validate: positive },
-  spawnWakeEnabled: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_ENABLED', default: true, description: 'Whether the destructive disposable-agent probe runs.', parse: configTypes.boolean },
+  spawnWakeEnabled: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_ENABLED', default: false, description: 'Whether the mutating disposable core phi probe runs after shadow verification.', parse: configTypes.boolean },
   spawnWakeModel: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_MODEL', default: '', description: 'Optional model override for the disposable probe agent.', parse: configTypes.string },
   probeDoc: { env: 'TLDA_DEV_BOT_DOC', default: '', description: 'Optional project selected for the SVG load probe.', parse: configTypes.string },
   assetPathOverride: { env: 'TLDA_DEV_BOT_ASSET_PATH_OVERRIDE', default: '', description: 'Optional exact SVG asset path for the document probe.', parse: configTypes.string },
@@ -284,29 +284,37 @@ async function cleanupSpawnWakeProbe({ agentId, taskId }) {
   }
 }
 
-async function checkSpawnWakeSeat() {
-  if (!SPAWN_WAKE_ENABLED) {
+export async function checkSpawnWakeSeat({
+  request = sendRequest,
+  waitReady = waitForSpawnReady,
+  waitTrace = waitForControlTrace,
+  cleanup = cleanupSpawnWakeProbe,
+  uuid = randomUUID,
+  now = () => Date.now(),
+  force = false,
+} = {}) {
+  if (!SPAWN_WAKE_ENABLED && !force) {
     return { skipped: true, reason: 'disabled' }
   }
   if (spawnWakeProbeInFlight) {
     return { skipped: true, reason: 'previous probe still in flight' }
   }
-  const now = Date.now()
-  if (lastSpawnWakeProbeAt && now - lastSpawnWakeProbeAt < SPAWN_WAKE_INTERVAL_MS) {
+  const startedAt = now()
+  if (!force && lastSpawnWakeProbeAt && startedAt - lastSpawnWakeProbeAt < SPAWN_WAKE_INTERVAL_MS) {
     return { skipped: true, reason: 'cadence', nextAt: new Date(lastSpawnWakeProbeAt + SPAWN_WAKE_INTERVAL_MS).toISOString() }
   }
 
   spawnWakeProbeInFlight = true
-  lastSpawnWakeProbeAt = now
+  lastSpawnWakeProbeAt = startedAt
   let agentId = null
   let taskId = null
-  const deadline = now + SPAWN_WAKE_TIMEOUT_MS
-  const suffix = randomUUID().slice(0, 8)
+  const deadline = startedAt + SPAWN_WAKE_TIMEOUT_MS
+  const suffix = uuid().slice(0, 8)
   const name = `dev-probe-seat-${suffix}`
-  const terminalToken = `dev-terminal-probe:${randomUUID()}`
-  const wakeToken = `dev-wake-probe:${randomUUID()}`
+  const terminalToken = `dev-terminal-probe:${uuid()}`
+  const wakeToken = `dev-wake-probe:${uuid()}`
   try {
-    const spawn = await sendRequest({
+    const spawn = await request({
       type: 'spawn',
       fresh: true,
       name,
@@ -319,19 +327,29 @@ async function checkSpawnWakeSeat() {
     }
     agentId = spawn.agent_id
 
-    const { seat } = await waitForSpawnReady(agentId, deadline)
-    const alive = await sendRequest({ type: 'check-alive', agent: agentId }, REQUEST_TIMEOUT_MS)
+    const { seat } = await waitReady(agentId, deadline)
+    const alive = await request({ type: 'check-alive', agent: agentId }, REQUEST_TIMEOUT_MS)
     if (alive?.state !== 'alive') {
       throw new Error(`spawned agent ${agentId} is not alive after seat binding (state=${alive?.state || 'unknown'} reason=${alive?.reason || 'none'})`)
     }
 
-    await sendRequest({ type: 'send-text', agent: agentId, text: terminalToken, enter: false }, REQUEST_TIMEOUT_MS)
-    const capture = await sendRequest({ type: 'capture-pane', agent: agentId, lines: 20 }, REQUEST_TIMEOUT_MS)
+    await request({ type: 'send-text', agent: agentId, text: terminalToken, enter: false }, REQUEST_TIMEOUT_MS)
+    const capture = await request({ type: 'capture-pane', agent: agentId, lines: 20 }, REQUEST_TIMEOUT_MS)
     if (!String(capture?.content || '').includes(terminalToken)) {
       throw new Error(`terminal route for ${agentId} accepted send-text but capture-pane did not show the probe token`)
     }
 
-    const delegate = await sendRequest({
+    const initialInbox = await request({ type: 'my-task', agent: agentId, peek: true }, REQUEST_TIMEOUT_MS)
+    if (!initialInbox || typeof initialInbox !== 'object') {
+      throw new Error(`spawned agent ${agentId} logged in but inbox did not return a response`)
+    }
+
+    const hibernated = await request({ type: 'hibernate-session', agent: agentId }, REQUEST_TIMEOUT_MS)
+    if (!hibernated?.ok) {
+      throw new Error(`hibernate did not confirm session shutdown for ${agentId}`)
+    }
+
+    const delegate = await request({
       type: 'delegate',
       from: AGENT_ID,
       agent: agentId,
@@ -343,7 +361,7 @@ async function checkSpawnWakeSeat() {
     if (!delegate?.ok || !delegate.trace_id || !taskId) {
       throw new ProbeIndeterminateError(`delegate wake did not return task and trace evidence (${JSON.stringify(delegate)})`)
     }
-    const trace = await waitForControlTrace(delegate.trace_id, event => {
+    const trace = await waitTrace(delegate.trace_id, event => {
       if (event.operation === 'wake.noop' && event.status === 'already-awake') return true
       if (event.operation === 'wake.respawn' && event.status === 'sent') return true
       if (event.operation === 'wake.error' || event.status === 'failed') return true
@@ -353,7 +371,13 @@ async function checkSpawnWakeSeat() {
       throw new Error(`wake routing failed for ${agentId}: ${trace.event.error || JSON.stringify(trace.event.detail || {})}`)
     }
 
-    const inbox = await sendRequest({ type: 'my-task', agent: agentId }, REQUEST_TIMEOUT_MS)
+    const resumed = await waitReady(agentId, deadline)
+    const resumedAlive = await request({ type: 'check-alive', agent: agentId }, REQUEST_TIMEOUT_MS)
+    if (resumedAlive?.state !== 'alive') {
+      throw new Error(`woken agent ${agentId} did not restore a live logged-in session (state=${resumedAlive?.state || 'unknown'})`)
+    }
+
+    const inbox = await request({ type: 'my-task', agent: agentId, peek: true }, REQUEST_TIMEOUT_MS)
     const sawTask = inbox?.task?.id === taskId || (Array.isArray(inbox?.tasks) && inbox.tasks.some(task => task.id === taskId))
     const sawMessage = Array.isArray(inbox?.messages) && inbox.messages.some(message => message.task_id === taskId || message.text === wakeToken)
     if (!sawTask || !sawMessage) {
@@ -367,11 +391,16 @@ async function checkSpawnWakeSeat() {
         sessionId: seat.session_id,
         daemonKey: seat.daemon_key,
       },
+      resumedSeat: {
+        sessionId: resumed.seat.session_id,
+        daemonKey: resumed.seat.daemon_key,
+      },
+      hibernated: true,
       wake: trace.event.status,
       taskId,
     }
   } finally {
-    await cleanupSpawnWakeProbe({ agentId, taskId })
+    await cleanup({ agentId, taskId })
     spawnWakeProbeInFlight = false
   }
 }
@@ -472,7 +501,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: server health through real doc SVG asset load; lower-cadence live spawn/wake/seat probe.',
+    'Coverage: real document SVG load; opt-in disposable core phi path across spawn/login/inbox/hibernate/delegate/wake/login/inbox.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)

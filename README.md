@@ -1,7 +1,8 @@
 # tlda dev bot
 
-The dev bot monitors the configured testing environment with real document-load
-and spawn/wake/seat probes. Healthy checks stay quiet. Failures notify eligible
+The dev bot monitors the configured testing environment with a real document-load
+probe and an opt-in disposable core phi probe across
+spawn/login/inbox/hibernate/delegate/wake/login/inbox. Healthy checks stay quiet. Failures notify eligible
 on-call agents. The bot also owns cleanup of idle Playwright sessions, merged
 clean worktrees, and over-budget worktree dependency caches.
 
@@ -48,7 +49,7 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_REQUEST_TIMEOUT_MS` (requestTimeoutMs; default: `15000`) — Fleet and HTTP request timeout in milliseconds.
 - `TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS` (spawnWakeIntervalMs; default: `1800000`) — Spawn/wake probe cadence in milliseconds.
 - `TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS` (spawnWakeTimeoutMs; default: `180000`) — Overall spawn/wake probe deadline.
-- `TLDA_DEV_BOT_SPAWN_WAKE_ENABLED` (spawnWakeEnabled; default: `true`) — Whether the destructive disposable-agent probe runs.
+- `TLDA_DEV_BOT_SPAWN_WAKE_ENABLED` (spawnWakeEnabled; default: `false`) — Whether the mutating disposable core phi probe runs after shadow verification.
 - `TLDA_DEV_BOT_SPAWN_WAKE_MODEL` (spawnWakeModel; default: `""`) — Optional model override for the disposable probe agent.
 - `TLDA_DEV_BOT_DOC` (probeDoc; default: `""`) — Optional project selected for the SVG load probe.
 - `TLDA_DEV_BOT_ASSET_PATH_OVERRIDE` (assetPathOverride; default: `""`) — Optional exact SVG asset path for the document probe.
