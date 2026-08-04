@@ -24,7 +24,7 @@ import {
   getServerUrl,
   parseConfig,
 } from '@tlda/bot'
-import { labelsForAgent } from '@tlda/bot'
+import { labelsForAgent, reapIdlePreviews } from '@tlda/bot'
 import { createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -515,6 +515,10 @@ async function cleanupResources() {
   if (resourceCleanupInFlight || !bot?.isCanonical()) return
   resourceCleanupInFlight = true
   try {
+    const previews = reapIdlePreviews()
+    for (const entry of previews.failed) {
+      console.error(`[dev-bot] preview reap failed for pid=${entry.pid} port=${entry.port}: ${entry.error}`)
+    }
     const results = await playwrightPoolCleanup.sweep()
     for (const result of results) {
       if (result.state === 'reaped') {
