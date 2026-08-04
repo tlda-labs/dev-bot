@@ -29,6 +29,31 @@ test('keeps a managed session while it has a claimed tab', async () => {
   assert.equal(calls.some(call => call.includes('reap')), false)
 })
 
+test('reads the global Playwright inventory once per pool sweep', async () => {
+  const calls = []
+  const cleanup = createPlaywrightPoolCleanup({
+    baseSession: 'shared',
+    capacity: 3,
+    playwrightCli: 'playwright-cli',
+    tldaDev: 'tlda-dev',
+    run: async (command, args) => {
+      calls.push([command, ...args])
+      if (command === 'playwright-cli' && args[0] === 'list') {
+        return { stdout: '- shared:\n  - status: open\n- shared-2:\n  - status: open\n- shared-3:\n  - status: open\n' }
+      }
+      if (command === 'playwright-cli') return { stdout: '- 0: [pwtab=live-agent](https://example.test/?pwtab=live-agent)\n' }
+      return { stdout: '' }
+    },
+  })
+
+  assert.deepEqual(await cleanup.sweep(), [
+    { session: 'shared', state: 'claimed' },
+    { session: 'shared-2', state: 'claimed' },
+    { session: 'shared-3', state: 'claimed' },
+  ])
+  assert.equal(calls.filter(call => call[0] === 'playwright-cli' && call[1] === 'list').length, 1)
+})
+
 test('reaps only after a managed session stays empty for the idle threshold', async t => {
   const disposable = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'])
   t.after(() => {

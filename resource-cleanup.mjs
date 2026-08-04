@@ -183,14 +183,9 @@ export function createPlaywrightPoolCleanup({
 } = {}) {
   const emptySince = new Map()
 
-  async function sweepSession(session) {
+  async function sweepSession(session, listOutput) {
     const env = { ...process.env, TLDA_PW_SESSION: session }
-    const list = await run(playwrightCli, ['list'], {
-      timeout: queryTimeoutMs,
-      encoding: 'utf8',
-      cwd: MAIN_REPO,
-    })
-    if (!sessionIsOpen(list.stdout || '', session)) {
+    if (!sessionIsOpen(listOutput, session)) {
       emptySince.delete(session)
       return { session, state: 'down' }
     }
@@ -218,9 +213,24 @@ export function createPlaywrightPoolCleanup({
 
   async function sweep() {
     const results = []
+    let listOutput
+    try {
+      const list = await run(playwrightCli, ['list'], {
+        timeout: queryTimeoutMs,
+        encoding: 'utf8',
+        cwd: MAIN_REPO,
+      })
+      listOutput = list.stdout || ''
+    } catch (error) {
+      return poolSessions(baseSession, capacity).map(session => ({
+        session,
+        state: 'error',
+        error: error?.message || String(error),
+      }))
+    }
     for (const session of poolSessions(baseSession, capacity)) {
       try {
-        results.push(await sweepSession(session))
+        results.push(await sweepSession(session, listOutput))
       } catch (error) {
         results.push({ session, state: 'error', error: error?.message || String(error) })
       }
