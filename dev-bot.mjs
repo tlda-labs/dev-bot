@@ -629,7 +629,6 @@ export const commands = [{
   summary: 'Publish and return the current disk/worktree status report.',
   help: 'Writes the current semantic Markdown report and interactive timeline to the ordinary info project through the normal source-change pipeline, then returns its project-file reference.',
   examples: ['status'],
-  authorize: ({ from }) => from === OWNER_ID,
   handler: async ({ reply }) => {
     await reply(await publishStatus())
   },
