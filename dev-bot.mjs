@@ -666,7 +666,7 @@ export const commands = [{
 if (process.env.TLDA_DEV_BOT_NO_START !== '1') {
   bot = createBot({
     name: AGENT_NAME,
-    labels: ['bot', BOT_KEY],
+    labels: ['bot'],
     server: FLEET_SERVER,
     cwd: REPO_ROOT,
     metadata: { config: CONFIG_NAME },
