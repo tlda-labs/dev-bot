@@ -8,6 +8,10 @@ const { configSchema, publishStatus, renderStatusMarkdown } = await import('./de
 test('linked remote safety probe is explicit opt-in', () => {
   assert.equal(configSchema.fields.linkedRemoteEnabled.default, false)
   assert.equal(configSchema.fields.linkedRemoteEnabled.env, 'TLDA_DEV_BOT_LINKED_REMOTE_ENABLED')
+  assert.equal(configSchema.fields.linkedRemoteUrl.default, '')
+  assert.equal(configSchema.fields.linkedRemoteUrl.env, 'TLDA_DEV_BOT_LINKED_REMOTE_URL')
+  assert.equal(configSchema.fields.linkedRemoteTokenFile.default, '')
+  assert.equal(configSchema.fields.linkedRemoteTokenFile.env, 'TLDA_DEV_BOT_LINKED_REMOTE_TOKEN_FILE')
 })
 
 test('status Markdown is semantic, labeled, timestamped, provenance-bearing, and interactive', () => {

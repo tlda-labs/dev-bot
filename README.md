@@ -53,6 +53,8 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_SPAWN_WAKE_MODEL` (spawnWakeModel; default: `""`) — Optional model override for the disposable probe agent.
 - `TLDA_DEV_BOT_LINKED_REMOTE_ENABLED` (linkedRemoteEnabled; default: `false`) — Whether to exercise the disposable linked Git remote.
 - `TLDA_DEV_BOT_LINKED_REMOTE_INTERVAL_MS` (linkedRemoteIntervalMs; default: `1800000`) — Linked remote safety probe cadence in milliseconds.
+- `TLDA_DEV_BOT_LINKED_REMOTE_URL` (linkedRemoteUrl; default: `""`) — Reachable disposable Git remote URL used instead of the local Git daemon fixture.
+- `TLDA_DEV_BOT_LINKED_REMOTE_TOKEN_FILE` (linkedRemoteTokenFile; default: `""`) — File containing the disposable Git remote token.
 - `TLDA_DEV_BOT_LINKED_REMOTE_HOST` (linkedRemoteHost; default: `""`) — Tailnet address advertised by the disposable Git remote.
 - `TLDA_DEV_BOT_LINKED_REMOTE_PORT` (linkedRemotePort; default: `19418`) — Port for the disposable Git remote.
 - `TLDA_DEV_BOT_LINKED_REMOTE_RESTART_COMMAND` (linkedRemoteRestartCommand; default: `""`) — Command that restarts the testing server during the linked remote transition.

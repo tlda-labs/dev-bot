@@ -46,10 +46,12 @@ async function waitUntil(check, { timeoutMs = 60_000, intervalMs = 500, descript
   throw new Error(`${description} did not converge${lastError ? `: ${lastError.message}` : ''}`)
 }
 
-async function git(cwd, ...args) {
-  const result = await execFile('git', args, { cwd, timeout: 120_000, maxBuffer: 10 * 1024 * 1024 })
+async function gitWithEnv(cwd, env, ...args) {
+  const result = await execFile('git', args, { cwd, env, timeout: 120_000, maxBuffer: 10 * 1024 * 1024 })
   return result.stdout.trim()
 }
+
+const git = (cwd, ...args) => gitWithEnv(cwd, process.env, ...args)
 
 async function portIsOpen(host, port) {
   return new Promise(resolve => {
@@ -72,6 +74,8 @@ export async function createGitRemoteProbeDriver({
   storeServer,
   fixtureRoot,
   project = 'dev-linked-remote-probe',
+  remoteUrl: configuredRemoteUrl,
+  remoteToken,
   remoteHost,
   remotePort = 19418,
   restart,
@@ -81,25 +85,38 @@ export async function createGitRemoteProbeDriver({
   if (!fixtureRoot) throw new Error('linked remote probe requires fixtureRoot')
   if (!restart) throw new Error('linked remote probe requires a configured testing server restart hook')
 
-  if (!remoteHost) {
+  if (!configuredRemoteUrl && !remoteHost) {
     remoteHost = (await execFile('tailscale', ['ip', '-4'], { timeout: 5000 })).stdout.trim().split(/\s+/)[0]
   }
-  if (!remoteHost) throw new Error('linked remote probe could not determine a tailnet address')
+  if (!configuredRemoteUrl && !remoteHost) throw new Error('linked remote probe could not determine a tailnet address')
 
   fs.mkdirSync(fixtureRoot, { recursive: true })
   const bare = path.join(fixtureRoot, 'remote.git')
   const work = path.join(fixtureRoot, 'remote-work')
-  if (!fs.existsSync(path.join(bare, 'HEAD'))) {
-    await git(fixtureRoot, 'init', '--bare', '--initial-branch=main', bare)
+  const remoteGitEnv = remoteToken
+    ? {
+        ...process.env,
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'http.extraHeader',
+        GIT_CONFIG_VALUE_0: `Authorization: Basic ${Buffer.from(`git:${remoteToken}`).toString('base64')}`,
+      }
+    : process.env
+  const remoteGit = (cwd, ...args) => gitWithEnv(cwd, remoteGitEnv, ...args)
+  if (!configuredRemoteUrl) {
+    if (!fs.existsSync(path.join(bare, 'HEAD'))) {
+      await git(fixtureRoot, 'init', '--bare', '--initial-branch=main', bare)
+    }
   }
   if (!fs.existsSync(path.join(work, '.git'))) {
-    await git(fixtureRoot, 'clone', bare, work)
-    await git(work, 'config', 'user.name', 'tlda dev bot')
-    await git(work, 'config', 'user.email', 'dev-bot@tlda.local')
+    await remoteGit(fixtureRoot, 'clone', configuredRemoteUrl || bare, work)
+  } else if (configuredRemoteUrl) {
+    await git(work, 'remote', 'set-url', 'origin', configuredRemoteUrl)
   }
+  await git(work, 'config', 'user.name', 'tlda dev bot')
+  await git(work, 'config', 'user.email', 'dev-bot@tlda.local')
 
   let daemon = null
-  if (!await portIsOpen(remoteHost, remotePort)) {
+  if (!configuredRemoteUrl && !await portIsOpen(remoteHost, remotePort)) {
     daemon = spawn('git', [
       'daemon', '--reuseaddr', '--export-all', '--enable=receive-pack',
       `--base-path=${fixtureRoot}`, `--listen=${remoteHost}`, `--port=${remotePort}`,
@@ -111,7 +128,7 @@ export async function createGitRemoteProbeDriver({
     })
   }
 
-  const remoteUrl = `git://${remoteHost}:${remotePort}/remote.git`
+  const remoteUrl = configuredRemoteUrl || `git://${remoteHost}:${remotePort}/remote.git`
   const mainFile = 'main.md'
   const api = async (suffix, options = {}, okStatuses = []) => {
     const response = await fetch(`${storeServer}${encodedProjectPath(project, suffix)}`, {
@@ -136,27 +153,48 @@ export async function createGitRemoteProbeDriver({
   }
   const authority = async () => (await api('/source-authority')).body
   const projectRecord = async () => (await api('')).body
+  const hasRemoteHead = async () => {
+    if (configuredRemoteUrl) {
+      const output = await remoteGit(work, 'ls-remote', '--heads', 'origin', 'refs/heads/main')
+      return Boolean(output)
+    }
+    return git(bare, 'rev-parse', '--verify', 'refs/heads/main').then(() => true, () => false)
+  }
   const commitRemote = async content => {
-    await git(work, 'fetch', 'origin')
-    const hasHead = await git(bare, 'rev-parse', '--verify', 'refs/heads/main').then(() => true, () => false)
+    const hasHead = await hasRemoteHead()
+    if (hasHead) await remoteGit(work, 'fetch', 'origin')
     if (hasHead) await git(work, 'reset', '--hard', 'origin/main')
     fs.writeFileSync(path.join(work, mainFile), content)
     await git(work, 'add', mainFile)
     await git(work, 'commit', '-m', `dev probe ${randomUUID()}`)
-    await git(work, 'push', 'origin', 'HEAD:main')
+    await remoteGit(work, 'push', 'origin', 'HEAD:main')
     return git(work, 'rev-parse', 'HEAD')
   }
-  const remoteHead = async () => git(bare, 'rev-parse', 'refs/heads/main')
-  const remoteCount = async () => Number(await git(bare, 'rev-list', '--count', 'refs/heads/main'))
-  const remoteContent = async () => git(bare, 'show', `refs/heads/main:${mainFile}`)
+  const refreshRemote = async () => {
+    if (configuredRemoteUrl) await remoteGit(work, 'fetch', 'origin')
+  }
+  const remoteHead = async () => {
+    await refreshRemote()
+    return git(configuredRemoteUrl ? work : bare, 'rev-parse', configuredRemoteUrl ? 'origin/main' : 'refs/heads/main')
+  }
+  const remoteCount = async () => {
+    await refreshRemote()
+    return Number(await git(configuredRemoteUrl ? work : bare, 'rev-list', '--count', configuredRemoteUrl ? 'origin/main' : 'refs/heads/main'))
+  }
+  const remoteContent = async () => {
+    await refreshRemote()
+    return git(configuredRemoteUrl ? work : bare, 'show', `${configuredRemoteUrl ? 'origin/main' : 'refs/heads/main'}:${mainFile}`)
+  }
   const sync = async () => api('/overleaf-sync', { method: 'POST', body: '{}' })
   const exactSourceRenderHistory = async expected => {
     await waitUntil(async () => (await source()).content === expected, { description: 'exact tlda source' })
+    const renderMarker = expected.trim().split('\n').at(-1)
     await waitUntil(async () => {
-      const response = await fetch(`${storeServer}/docs/${encodeURIComponent(project)}/${mainFile.replace(/\.md$/i, '.html')}?t=${Date.now()}`, {
+      const response = await fetch(`${storeServer}/docs/${encodeURIComponent(project)}/index.html?t=${Date.now()}`, {
         signal: AbortSignal.timeout(requestTimeoutMs),
       })
-      return response.ok && (await response.text()).includes(expected.trim())
+      const html = response.ok ? await response.text() : ''
+      return html.includes('<title>Linked remote probe</title>') && html.includes(renderMarker)
     }, { timeoutMs: 120_000, description: 'exact rendered document' })
     await waitUntil(async () => {
       const versions = (await api('/history/shadow?limit=10')).body?.versions || []
@@ -164,7 +202,8 @@ export async function createGitRemoteProbeDriver({
       const response = await fetch(`${storeServer}${encodedProjectPath(project, `/history/shadow/source?version=${versions[0].hash}&file=${mainFile}`)}`, {
         signal: AbortSignal.timeout(requestTimeoutMs),
       })
-      return response.ok && await response.text() === expected
+      if (!response.ok) return false
+      return (await response.json()).content === expected
     }, { description: 'exact shadow history' })
   }
   const tldaEdit = async (content, expectedRevision) => api(`/source/${mainFile}`, {
@@ -175,14 +214,14 @@ export async function createGitRemoteProbeDriver({
   return {
     async establish() {
       const initial = `# Linked remote probe\n\nBASE ${randomUUID()}\n`
-      if (!await git(bare, 'rev-parse', '--verify', 'refs/heads/main').then(() => true, () => false)) {
+      if (!await hasRemoteHead()) {
         await commitRemote(initial)
       }
       const current = await api('', {}, [404])
       if (current.status === 404 || !current.body?.overleafRemote) {
         await api('/link', {
           method: 'POST',
-          body: JSON.stringify({ source: remoteUrl, mainFile, format: 'markdown', pollSeconds: 15 }),
+          body: JSON.stringify({ source: remoteUrl, token: remoteToken, mainFile, format: 'markdown', pollSeconds: 15 }),
         })
       } else if (current.body?.overleafRemote !== remoteUrl) {
         throw new Error(`probe project is linked to ${current.body?.overleafRemote || 'no remote'}, expected ${remoteUrl}`)
