@@ -51,6 +51,11 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS` (spawnWakeTimeoutMs; default: `180000`) — Overall spawn/wake probe deadline.
 - `TLDA_DEV_BOT_SPAWN_WAKE_ENABLED` (spawnWakeEnabled; default: `false`) — Whether the mutating disposable core phi probe runs after shadow verification.
 - `TLDA_DEV_BOT_SPAWN_WAKE_MODEL` (spawnWakeModel; default: `""`) — Optional model override for the disposable probe agent.
+- `TLDA_DEV_BOT_LINKED_REMOTE_ENABLED` (linkedRemoteEnabled; default: `false`) — Whether to exercise the disposable linked Git remote.
+- `TLDA_DEV_BOT_LINKED_REMOTE_INTERVAL_MS` (linkedRemoteIntervalMs; default: `1800000`) — Linked remote safety probe cadence in milliseconds.
+- `TLDA_DEV_BOT_LINKED_REMOTE_HOST` (linkedRemoteHost; default: `""`) — Tailnet address advertised by the disposable Git remote.
+- `TLDA_DEV_BOT_LINKED_REMOTE_PORT` (linkedRemotePort; default: `19418`) — Port for the disposable Git remote.
+- `TLDA_DEV_BOT_LINKED_REMOTE_RESTART_COMMAND` (linkedRemoteRestartCommand; default: `""`) — Command that restarts the testing server during the linked remote transition.
 - `TLDA_DEV_BOT_DOC` (probeDoc; default: `""`) — Optional project selected for the SVG load probe.
 - `TLDA_DEV_BOT_ASSET_PATH_OVERRIDE` (assetPathOverride; default: `""`) — Optional exact SVG asset path for the document probe.
 - `TLDA_DEV_BOT_ALLOW_NONDEFAULT` (allowNondefault; default: `false`) — Permit probing an environment not assigned to this bot.

@@ -3,7 +3,12 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
 process.env.TLDA_DEV_BOT_NO_START = '1'
-const { publishStatus, renderStatusMarkdown } = await import('./dev-bot.mjs')
+const { configSchema, publishStatus, renderStatusMarkdown } = await import('./dev-bot.mjs')
+
+test('linked remote safety probe is explicit opt-in', () => {
+  assert.equal(configSchema.fields.linkedRemoteEnabled.default, false)
+  assert.equal(configSchema.fields.linkedRemoteEnabled.env, 'TLDA_DEV_BOT_LINKED_REMOTE_ENABLED')
+})
 
 test('status Markdown is semantic, labeled, timestamped, provenance-bearing, and interactive', () => {
   const report = renderStatusMarkdown([{
