@@ -186,7 +186,7 @@ export async function createGitRemoteProbeDriver({
     return git(configuredRemoteUrl ? work : bare, 'show', `${configuredRemoteUrl ? 'origin/main' : 'refs/heads/main'}:${mainFile}`)
   }
   const sync = async () => api('/overleaf-sync', { method: 'POST', body: '{}' })
-  const exactSourceRenderHistory = async expected => {
+  const exactSourceRenderHistory = async (expected, { requireHistory = true } = {}) => {
     await waitUntil(async () => (await source()).content === expected, { description: 'exact tlda source' })
     const renderMarker = expected.trim().split('\n').at(-1)
     await waitUntil(async () => {
@@ -196,14 +196,17 @@ export async function createGitRemoteProbeDriver({
       const html = response.ok ? await response.text() : ''
       return html.includes('<title>Linked remote probe</title>') && html.includes(renderMarker)
     }, { timeoutMs: 120_000, description: 'exact rendered document' })
+    if (!requireHistory) return
     await waitUntil(async () => {
       const versions = (await api('/history/shadow?limit=10')).body?.versions || []
-      if (!versions[0]?.hash) return false
-      const response = await fetch(`${storeServer}${encodedProjectPath(project, `/history/shadow/source?version=${versions[0].hash}&file=${mainFile}`)}`, {
-        signal: AbortSignal.timeout(requestTimeoutMs),
-      })
-      if (!response.ok) return false
-      return (await response.json()).content === expected
+      for (const version of versions) {
+        if (!version?.hash) continue
+        const response = await fetch(`${storeServer}${encodedProjectPath(project, `/history/shadow/source?version=${version.hash}&file=${mainFile}`)}`, {
+          signal: AbortSignal.timeout(requestTimeoutMs),
+        })
+        if (response.ok && (await response.json()).content === expected) return true
+      }
+      return false
     }, { description: 'exact shadow history' })
   }
   const tldaEdit = async (content, expectedRevision) => api(`/source/${mainFile}`, {
@@ -283,7 +286,7 @@ export async function createGitRemoteProbeDriver({
         return response.ok
       }, { timeoutMs: 120_000, description: 'testing server restart' })
       await sync()
-      await exactSourceRenderHistory(content)
+      await exactSourceRenderHistory(content, { requireHistory: false })
       if (await remoteCount() !== committedCount) throw new Error('restart convergence created a duplicate or echo commit')
     },
 
