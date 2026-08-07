@@ -186,13 +186,6 @@ export async function createGitRemoteProbeDriver({
     await refreshRemote()
     return git(configuredRemoteUrl ? work : bare, 'show', `${configuredRemoteUrl ? 'origin/main' : 'refs/heads/main'}:${mainFile}`)
   }
-  const remoteHasMainFile = async () => {
-    await refreshRemote()
-    return git(
-      configuredRemoteUrl ? work : bare,
-      'cat-file', '-e', `${configuredRemoteUrl ? 'origin/main' : 'refs/heads/main'}:${mainFile}`,
-    ).then(() => true, () => false)
-  }
   const sync = async () => api('/overleaf-sync', { method: 'POST', body: '{}' })
   const exactSourceRenderHistory = async (expected, { requireHistory = true } = {}) => {
     await waitUntil(async () => (await source()).content === expected, { description: 'exact tlda source' })
@@ -225,7 +218,7 @@ export async function createGitRemoteProbeDriver({
   return {
     async establish() {
       const initial = `# Linked remote probe\n\nBASE ${randomUUID()}\n`
-      if (!await hasRemoteHead() || !await remoteHasMainFile()) {
+      if (!await hasRemoteHead()) {
         await commitRemote(initial)
       }
       const current = await api('', {}, [404])
