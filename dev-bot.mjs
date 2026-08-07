@@ -62,7 +62,6 @@ export const configSchema = defineConfig({
   linkedRemoteTokenFile: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_TOKEN_FILE', default: '', description: 'File containing the disposable Git remote token.', parse: configTypes.string },
   linkedRemoteHost: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_HOST', default: '', description: 'Tailnet address advertised by the disposable Git remote.', parse: configTypes.string },
   linkedRemotePort: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_PORT', default: 19_418, description: 'Port for the disposable Git remote.', parse: configTypes.integer, validate: positive },
-  linkedRemoteRestartCommand: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_RESTART_COMMAND', default: '', description: 'Command that restarts the testing server during the linked remote transition.', parse: configTypes.string },
   probeDoc: { env: 'TLDA_DEV_BOT_DOC', default: '', description: 'Optional project selected for the SVG load probe.', parse: configTypes.string },
   assetPathOverride: { env: 'TLDA_DEV_BOT_ASSET_PATH_OVERRIDE', default: '', description: 'Optional exact SVG asset path for the document probe.', parse: configTypes.string },
   allowNondefault: { env: 'TLDA_DEV_BOT_ALLOW_NONDEFAULT', default: false, description: 'Permit probing an environment not assigned to this bot.', parse: configTypes.boolean },
@@ -82,7 +81,6 @@ const {
   linkedRemoteEnabled: LINKED_REMOTE_ENABLED, linkedRemoteIntervalMs: LINKED_REMOTE_INTERVAL_MS,
   linkedRemoteUrl: LINKED_REMOTE_URL, linkedRemoteTokenFile: LINKED_REMOTE_TOKEN_FILE,
   linkedRemoteHost: LINKED_REMOTE_HOST, linkedRemotePort: LINKED_REMOTE_PORT,
-  linkedRemoteRestartCommand: LINKED_REMOTE_RESTART_COMMAND,
   assetPathOverride: ASSET_PATH_OVERRIDE, allowNondefault: ALLOW_NONDEFAULT, nudgeTo: NUDGE_TO_OVERRIDE,
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
@@ -219,18 +217,6 @@ let spawnWakeProbeInFlight = false
 let lastLinkedRemoteProbeAt = 0
 let linkedRemoteProbeInFlight = false
 
-async function restartTestingServer() {
-  if (!LINKED_REMOTE_RESTART_COMMAND) {
-    throw new Error('TLDA_DEV_BOT_LINKED_REMOTE_RESTART_COMMAND is not configured')
-  }
-  const { exec: execCb } = await import('node:child_process')
-  await new Promise((resolve, reject) => execCb(
-    LINKED_REMOTE_RESTART_COMMAND,
-    { timeout: 180_000 },
-    (error, stdout, stderr) => error ? reject(new Error(stderr?.trim() || stdout?.trim() || error.message)) : resolve(),
-  ))
-}
-
 export async function checkLinkedRemoteSafety({ force = false } = {}) {
   if (!LINKED_REMOTE_ENABLED && !force) return { skipped: true, reason: 'disabled' }
   if (linkedRemoteProbeInFlight) return { skipped: true, reason: 'previous probe still in flight' }
@@ -249,7 +235,6 @@ export async function checkLinkedRemoteSafety({ force = false } = {}) {
       remoteToken: LINKED_REMOTE_TOKEN_FILE ? fs.readFileSync(LINKED_REMOTE_TOKEN_FILE, 'utf8').trim() : undefined,
       remoteHost: LINKED_REMOTE_HOST || undefined,
       remotePort: LINKED_REMOTE_PORT,
-      restart: restartTestingServer,
       requestTimeoutMs: REQUEST_TIMEOUT_MS,
     })
     return await runLinkedRemoteProbe({ driver })
@@ -556,7 +541,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: real document SVG load; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite, restart/no-echo; opt-in core phi spawn/wake path.',
+    'Coverage: real document SVG load; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)

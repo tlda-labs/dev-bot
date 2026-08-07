@@ -25,7 +25,7 @@ test('linked remote probe rejects a divergent edit that advances accepted author
   assert.deepEqual(calls, ['remote-to-tlda', 'tlda-to-remote'])
 })
 
-test('linked remote probe proves both directions, conflict safety, then restart convergence', async () => {
+test('routine linked remote probe proves both directions and conflict safety without restarting', async () => {
   const calls = []
   const driver = {
     establish: async () => ({ baseRevision: 'base' }),
@@ -41,6 +41,23 @@ test('linked remote probe proves both directions, conflict safety, then restart 
   }
 
   const result = await runLinkedRemoteProbe({ driver })
-  assert.deepEqual(calls, ['remote-to-tlda', 'tlda-to-remote', 'restart'])
+  assert.deepEqual(calls, ['remote-to-tlda', 'tlda-to-remote'])
   assert.equal(result.ok, true)
+  assert.equal(result.restartChecked, false)
+})
+
+test('restart convergence is an explicit acceptance check', async () => {
+  const calls = []
+  const driver = {
+    establish: async () => ({ baseRevision: 'base' }),
+    proveRemoteToTlda: async () => calls.push('remote-to-tlda'),
+    proveTldaToRemote: async () => calls.push('tlda-to-remote'),
+    createDivergence: async () => ({ acceptedRevision: 'base', remoteHead: 'remote-a' }),
+    observeDivergence: async () => ({ acceptedRevision: 'base', remoteHead: 'remote-a', conflictVisible: true }),
+    proveRestartConvergence: async () => calls.push('restart'),
+  }
+
+  const result = await runLinkedRemoteProbe({ driver, includeRestart: true })
+  assert.deepEqual(calls, ['remote-to-tlda', 'tlda-to-remote', 'restart'])
+  assert.equal(result.restartChecked, true)
 })

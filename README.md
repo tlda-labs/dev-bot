@@ -57,7 +57,6 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_LINKED_REMOTE_TOKEN_FILE` (linkedRemoteTokenFile; default: `""`) — File containing the disposable Git remote token.
 - `TLDA_DEV_BOT_LINKED_REMOTE_HOST` (linkedRemoteHost; default: `""`) — Tailnet address advertised by the disposable Git remote.
 - `TLDA_DEV_BOT_LINKED_REMOTE_PORT` (linkedRemotePort; default: `19418`) — Port for the disposable Git remote.
-- `TLDA_DEV_BOT_LINKED_REMOTE_RESTART_COMMAND` (linkedRemoteRestartCommand; default: `""`) — Command that restarts the testing server during the linked remote transition.
 - `TLDA_DEV_BOT_DOC` (probeDoc; default: `""`) — Optional project selected for the SVG load probe.
 - `TLDA_DEV_BOT_ASSET_PATH_OVERRIDE` (assetPathOverride; default: `""`) — Optional exact SVG asset path for the document probe.
 - `TLDA_DEV_BOT_ALLOW_NONDEFAULT` (allowNondefault; default: `false`) — Permit probing an environment not assigned to this bot.

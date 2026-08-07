@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto'
 
 const execFile = promisify(execFileCb)
 
-export async function runLinkedRemoteProbe({ driver }) {
+export async function runLinkedRemoteProbe({ driver, includeRestart = false }) {
   const preconditions = await driver.establish()
   await driver.proveRemoteToTlda(preconditions)
   await driver.proveTldaToRemote(preconditions)
@@ -25,8 +25,10 @@ export async function runLinkedRemoteProbe({ driver }) {
     throw new Error('divergent edits did not visibly surface a conflict')
   }
 
-  await driver.proveRestartConvergence({ ...preconditions, ...divergent, ...observed })
-  return { ok: true, preconditions, divergent, observed }
+  if (includeRestart) {
+    await driver.proveRestartConvergence({ ...preconditions, ...divergent, ...observed })
+  }
+  return { ok: true, restartChecked: includeRestart, preconditions, divergent, observed }
 }
 
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms))
@@ -83,7 +85,6 @@ export async function createGitRemoteProbeDriver({
 } = {}) {
   if (!storeServer) throw new Error('linked remote probe requires storeServer')
   if (!fixtureRoot) throw new Error('linked remote probe requires fixtureRoot')
-  if (!restart) throw new Error('linked remote probe requires a configured testing server restart hook')
 
   if (!configuredRemoteUrl && !remoteHost) {
     remoteHost = (await execFile('tailscale', ['ip', '-4'], { timeout: 5000 })).stdout.trim().split(/\s+/)[0]
@@ -275,6 +276,7 @@ export async function createGitRemoteProbeDriver({
     },
 
     async proveRestartConvergence() {
+      if (!restart) throw new Error('restart acceptance requires a configured testing server restart hook')
       const content = `# Linked remote probe\n\nRESTART ${randomUUID()}\n`
       const beforeCount = await remoteCount()
       await commitRemote(content)
