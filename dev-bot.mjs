@@ -75,9 +75,10 @@ export const configSchema = defineConfig({
   statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
   agentSilenceWindowMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS', default: 7_200_000, description: 'How long an agent may hold a delivered message without producing anything before it is reported silent.', parse: configTypes.integer, validate: positive },
   agentSilenceLookbackMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS', default: 86_400_000, description: 'How far back to look for the delivery that an agent is silent on.', parse: configTypes.integer, validate: positive },
-  agentAliveMaxAgeS: { env: 'TLDA_DEV_BOT_AGENT_ALIVE_MAX_AGE_S', default: 600, description: 'Maximum last_seen age for the daemon to count as still reporting the process alive.', parse: configTypes.integer, validate: positive },
   channelSilenceWindowMs: { env: 'TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS', default: 600_000, description: 'How long an awake agent may hold no open fleet socket before it is reported off-channel.', parse: configTypes.integer, validate: positive },
   channelReportEnabled: { env: 'TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED', default: false, description: 'Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.', parse: configTypes.boolean },
+  agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence and channel checks, which each cost one whole-roster read.', parse: configTypes.integer, validate: positive },
+  rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
 })
 const config = parseConfig(configSchema)
 const {
@@ -91,8 +92,9 @@ const {
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
   agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
-  agentAliveMaxAgeS: AGENT_ALIVE_MAX_AGE_S, channelSilenceWindowMs: CHANNEL_SILENCE_WINDOW_MS,
+  channelSilenceWindowMs: CHANNEL_SILENCE_WINDOW_MS,
   channelReportEnabled: CHANNEL_REPORT_ENABLED,
+  agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
 } = config
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
@@ -613,8 +615,21 @@ function rowIsWatchable(row) {
   return !(Array.isArray(row.labels) && row.labels.includes('bot'))
 }
 
+// A whole-roster read is NOT an ordinary fleet request and must not inherit the
+// ordinary timeout. Measured against live testing on 2026-08-08, with 1,849
+// alive agents and 14,040 total: `/api/fleet-table?limit=500` took 44.9, 44.5
+// and 44.5 seconds on three consecutive warm calls, the `fleet-roster-truth` WS
+// read 29.8s, and `agents-page` 42.1s. At the bot's 15s request timeout every
+// one of these checks would have failed every sweep and nudged on-call about
+// its own timeout -- an alarm crying during normal operation, which is the one
+// outcome worse than no alarm. It is also why these checks run on their own
+// cadence rather than once a minute.
 async function fleetTableRows(filter) {
-  const data = await fetchJson(FLEET_SERVER, `/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`)
+  const res = await fetch(`${FLEET_SERVER}/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`, {
+    signal: AbortSignal.timeout(ROSTER_TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`fleet-table (${filter}) returned HTTP ${res.status}`)
+  const data = await res.json()
   return Array.isArray(data?.agents) ? data.agents : []
 }
 
@@ -654,7 +669,41 @@ async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
   return received[0] || null
 }
 
+// One roster read per check per cadence window. `lastResult` is replayed on a
+// skipped sweep rather than reporting `skipped`, so a standing failure keeps
+// failing between reads instead of alternating red/green every minute.
+const agentWatchState = new Map()
+
+function agentWatchDue(key) {
+  const previous = agentWatchState.get(key)
+  if (!previous) return true
+  return Date.now() - previous.at >= AGENT_WATCH_INTERVAL_MS
+}
+
+function agentWatchReplay(key) {
+  const previous = agentWatchState.get(key)
+  if (!previous) return { skipped: true, reason: 'cadence' }
+  if (previous.error) throw new Error(previous.error)
+  return { ...previous.value, cached: true }
+}
+
+function agentWatchRecord(key, value, error) {
+  agentWatchState.set(key, { at: Date.now(), value, error })
+}
+
 export async function checkAgentReceiving() {
+  if (!agentWatchDue('receiving')) return agentWatchReplay('receiving')
+  try {
+    const result = await runAgentReceiving()
+    agentWatchRecord('receiving', result, null)
+    return result
+  } catch (e) {
+    agentWatchRecord('receiving', null, e?.message || String(e))
+    throw e
+  }
+}
+
+async function runAgentReceiving() {
   const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
   if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
 
@@ -672,11 +721,17 @@ export async function checkAgentReceiving() {
   const botIds = await botSenderIds()
   const sinceIso = new Date(now - AGENT_SILENCE_LOOKBACK_MS).toISOString()
   const silent = []
+  // `filter=awake` IS the liveness gate. The runtime projection only calls an
+  // agent awake when its evidence is `liveness: alive`, which comes from the
+  // daemon's running-process snapshot -- so an agent in this list is one the
+  // daemon reports as a live process, which is exactly the precondition.
+  //
+  // An earlier revision also required a fresh `last_seen`. That was wrong on the
+  // data: on live testing every awake agent's `last_seen` read between 644s and
+  // 2500s stale, including this bot mid-tool-call, so the gate rejected the one
+  // true positive it existed to catch. `last_seen` is reported below as context
+  // and is not a precondition.
   for (const row of candidates) {
-    // The daemon must still be reporting the process. Without this the check
-    // reports every agent that simply exited, which is a different event with
-    // a different owner.
-    if (!Number.isFinite(row.last_seen_ago_s) || row.last_seen_ago_s > AGENT_ALIVE_MAX_AGE_S) continue
     const delivery = await lastRealDeliveryTo(row.id, botIds, sinceIso)
     if (!delivery?.timestamp) continue
     const deliveredAt = Date.parse(delivery.timestamp)
@@ -732,6 +787,18 @@ export async function checkAgentReceiving() {
 const channelAbsentSince = new Map()
 
 export async function checkAgentChannel() {
+  if (!agentWatchDue('channel')) return agentWatchReplay('channel')
+  try {
+    const result = await runAgentChannel()
+    agentWatchRecord('channel', result, null)
+    return result
+  } catch (e) {
+    agentWatchRecord('channel', null, e?.message || String(e))
+    throw e
+  }
+}
+
+async function runAgentChannel() {
   const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
   if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
   if (!rows.some(row => Object.hasOwn(row, 'fleet_socket_open'))) {
@@ -745,7 +812,6 @@ export async function checkAgentChannel() {
   for (const row of rows) {
     seen.add(row.id)
     if (row.fleet_socket_open !== false) { channelAbsentSince.delete(row.id); continue }
-    if (!Number.isFinite(row.last_seen_ago_s) || row.last_seen_ago_s > AGENT_ALIVE_MAX_AGE_S) continue
     if (!channelAbsentSince.has(row.id)) channelAbsentSince.set(row.id, now)
     const since = channelAbsentSince.get(row.id)
     if (now - since < CHANNEL_SILENCE_WINDOW_MS) continue

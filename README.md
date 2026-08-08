@@ -72,6 +72,8 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_AGENT_ALIVE_MAX_AGE_S` (agentAliveMaxAgeS; default: `600`) — Maximum last_seen age for the daemon to count as still reporting the process alive.
 - `TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS` (channelSilenceWindowMs; default: `600000`) — How long an awake agent may hold no open fleet socket before it is reported off-channel.
 - `TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED` (channelReportEnabled; default: `false`) — Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.
+- `TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS` (agentWatchIntervalMs; default: `300000`) — Cadence for the agent silence and channel checks, which each cost one whole-roster read.
+- `TLDA_DEV_BOT_ROSTER_TIMEOUT_MS` (rosterTimeoutMs; default: `90000`) — Timeout for a whole-roster read, which is far slower than an ordinary fleet request.
 <!-- END GENERATED CONFIG -->
 
 The shared harness also honors `TLDA_BOT_NAME`, `TLDA_BOT_PIDFILE`,
