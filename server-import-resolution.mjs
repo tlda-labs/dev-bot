@@ -13,11 +13,20 @@ import { builtinModules } from 'module'
 // the root only, and crash-looped testing for eleven minutes behind a clean
 // typecheck and a green suite.
 //
-// SCOPE: the boot graph, not the shipped tree. Walking every shipped file finds
-// true-but-unactionable things -- `scripts/e2e-test.mjs` ships and imports
-// `puppeteer-core`, which is genuinely absent from the image and never executed
-// there. Reporting those is how an alarm earns a mute. Only what actually runs
-// is followed, reached transitively from the entrypoints below.
+// SCOPE: the boot graph, not the shipped tree. Only what actually runs is
+// followed, reached transitively from the entrypoints below.
+//
+// Transitive matters here. The rule is `server/` AND `shared/`, because the
+// Dockerfile renames the manifest to /app/package.json so both trees resolve
+// against one /app/node_modules -- so a bare import added under `shared/` fails
+// identically. This walk covers it: 51 of the 148 files it reads on current main
+// are under `shared/`, and injecting a bare import into shared/fleet-labels.mjs
+// is reported. A `server/`-only scan would miss that.
+//
+// Walking every SHIPPED file, on the other hand, finds true-but-unactionable
+// things -- `scripts/e2e-test.mjs` ships and imports `puppeteer-core`, genuinely
+// absent from the image and never executed there. Reporting those is how an
+// alarm earns a mute.
 const ENTRYPOINTS = [
   'server/unified-server.mjs',
   'bin/build-worker.mjs',
@@ -41,16 +50,14 @@ const BUILTINS = new Set([...builtinModules, ...builtinModules.map(name => `node
 const RESOLVE_EXTENSIONS = ['', '.mjs', '.js', '.ts', '.mts', '.cjs', '/index.mjs', '/index.js', '/index.ts']
 
 // Anchored at a line-start `import`/`export`, which is what a static import
-// statement always is. An unanchored `from '...'` also matches SQL inside the
-// template literals this codebase is full of -- the first version of this check
-// reported 27 of those as missing packages, a ~99% false-positive rate on its
-// own first run. The bounded `[\s\S]{0,400}?` spans a multi-line specifier list
-// without spanning into the next statement.
-// The span between the keyword and `from` excludes quotes, backticks and
-// semicolons. A real import clause never contains one -- `import { a, b } from`,
-// `export * from` -- while every false positive here was a line-start `export`
-// whose template literal happened to contain the word `from` followed by a
-// quote, several hundred characters later, inside SQL.
+// statement always is, and the span up to `from` excludes quotes, backticks and
+// semicolons, which no real import clause contains.
+//
+// An unanchored `from '...'` instead matches SQL inside the template literals
+// this codebase is full of: the first version of this check reported 27 of those
+// as missing packages, a ~99% false-positive rate on its own first run. Every
+// one was a line-start `export` whose template literal happened to contain the
+// word `from` followed by a quote, several hundred characters later.
 const SPECIFIER_PATTERNS = [
   /^\s*(?:import|export)(?![\w$])[^'"`;]{0,400}?\bfrom\s*['"]([^'"]+)['"]/gm,
   /^\s*import\s*['"]([^'"]+)['"]/gm,
@@ -88,12 +95,34 @@ function isShipped(repoRoot, absolute) {
   return SHIPPED_PATHS.some(shipped => relative === shipped || relative.startsWith(`${shipped}/`))
 }
 
+// Which manifest ships is a fact stated in the Dockerfile -- `COPY <path>
+// ./package.json` -- so it is read from there rather than hard-coded. A guard
+// that hard-codes `server/package.json` is asserting something it has not
+// checked, and a guard that is wrong for a reason unrelated to the question it
+// answers is the same failure it exists to prevent, automated and trusted more.
+// If that COPY line moves, this returns null and the check reports that it could
+// not determine the shipped manifest, rather than silently checking the wrong one.
+export function shippedManifestPath(dockerfileSource) {
+  const match = String(dockerfileSource || '').match(/^\s*COPY\s+(\S+)\s+\.\/package\.json\s*$/m)
+  return match ? match[1] : null
+}
+
 export function checkServerImports({
   repoRoot,
   readFile = (file) => fs.readFileSync(file, 'utf8'),
   exists = (file) => { try { return fs.statSync(file).isFile() } catch { return false } },
 } = {}) {
-  const manifestPath = path.join(repoRoot, 'server', 'package.json')
+  const dockerfilePath = path.join(repoRoot, 'Dockerfile.live')
+  let manifestRelative
+  try {
+    manifestRelative = shippedManifestPath(readFile(dockerfilePath))
+  } catch (e) {
+    throw new Error(`cannot read ${dockerfilePath}: ${e.message}`)
+  }
+  if (!manifestRelative) {
+    throw new Error(`${dockerfilePath} has no \`COPY <path> ./package.json\` line, so the shipped dependency manifest cannot be determined`)
+  }
+  const manifestPath = path.join(repoRoot, manifestRelative)
   let manifest
   try {
     manifest = JSON.parse(readFile(manifestPath))
@@ -141,7 +170,7 @@ export function checkServerImports({
     }
   }
 
-  return { reachable: visited.size, declared: declared.size, missing, unshipped, unresolved }
+  return { reachable: visited.size, declared: declared.size, manifest: manifestRelative, missing, unshipped, unresolved }
 }
 
 export function describeServerImportFailures({ missing, unshipped, unresolved }) {

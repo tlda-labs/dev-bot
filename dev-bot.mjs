@@ -10,6 +10,7 @@
 import fs from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
+import { DatabaseSync } from 'node:sqlite'
 import { fileURLToPath } from 'url'
 
 import {
@@ -81,6 +82,7 @@ export const configSchema = defineConfig({
   agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence and channel checks, which each cost one whole-roster read.', parse: configTypes.integer, validate: positive },
   serverImportsRepo: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_REPO', default: '', description: 'tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.', parse: configTypes.string },
   serverImportsIntervalMs: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS', default: 600_000, description: 'Cadence for the server import resolution check.', parse: configTypes.integer, validate: positive },
+  daemonLedgerDb: { env: 'TLDA_DEV_BOT_DAEMON_LEDGER_DB', default: path.join(CONFIG_DIR, 'fleet-daemon.db'), description: 'Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.', parse: configTypes.string },
   rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
 })
 const config = parseConfig(configSchema)
@@ -99,7 +101,9 @@ const {
   channelReportEnabled: CHANNEL_REPORT_ENABLED,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
   serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
+  daemonLedgerDb: DAEMON_LEDGER_DB,
 } = config
+const DAEMON_KEY = process.env.FLEET_DAEMON_KEY || `${process.env.TLDA_BOT_MACHINE_ID || process.env.TLDA_MACHINE_ID || ''}:${CONFIG_NAME}`
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
   throw new Error(`dev bot only probes configured environments ${JSON.stringify(ALLOWED_ENVIRONMENTS)}; active config is "${CONFIG_NAME}"`)
@@ -612,6 +616,49 @@ export async function checkSpawnWakeSeat({
 // (tlda 99a308836). An older server omits them and the checks say so rather
 // than reading the absence as a healthy answer.
 
+// Whether the daemon can PLACE this agent — whether it has a row in the
+// permission_grants ledger for this daemon key. `resolveTerminalAgent` reads
+// that table to answer "which tmux session does this agent own", so an agent
+// with no row is unreachable by every daemon terminal operation: kill, restart,
+// send-text, capture. `rpcKillSession` then answers `{ ok: true,
+// already_unavailable: true }`, which is right for a hibernate and a lie for a
+// restart, so the CLI prints ok and nothing happens.
+//
+// It is a third fact beside the two the check already reads, in the message
+// rather than as its own alarm: it turns "this agent is silent" into "this agent
+// is silent and nobody can restart it", which is the difference between a nudge
+// and an escalation. On 2026-08-08 `math-delivery-oncall` and
+// `really-able-to-do-stuff` both had no row while 2,057 existed for mini:testing.
+//
+// Returns null on any failure — the ledger is the daemon's and this is a
+// best-effort read. Null is "not measured", never "no row": reporting an agent
+// as unplaceable because sqlite was busy would be a fabricated escalation.
+function daemonCanPlace(agentId) {
+  if (!DAEMON_LEDGER_DB || !DAEMON_KEY) return null
+  try {
+    const row = daemonLedger()?.prepare(
+      'SELECT 1 FROM permission_grants WHERE id = ? AND daemon_key = ? LIMIT 1',
+    ).get(agentId, DAEMON_KEY)
+    return !!row
+  } catch (e) {
+    console.error(`[dev-bot] permission_grants read failed for ${agentId}: ${e.message}`)
+    return null
+  }
+}
+
+let _daemonLedger = null
+let _daemonLedgerFailed = false
+function daemonLedger() {
+  if (_daemonLedger || _daemonLedgerFailed) return _daemonLedger
+  try {
+    _daemonLedger = new DatabaseSync(DAEMON_LEDGER_DB, { readOnly: true })
+  } catch (e) {
+    _daemonLedgerFailed = true
+    console.error(`[dev-bot] cannot open daemon ledger ${DAEMON_LEDGER_DB}: ${e.message}`)
+  }
+  return _daemonLedger
+}
+
 function rowIsWatchable(row) {
   if (!row || row.human) return false
   if (row.id === AGENT_ID || row.id === OWNER_ID) return false
@@ -756,6 +803,7 @@ async function runAgentReceiving() {
       activity: row.activity || null,
       tool: row.tool || null,
       socketOpen: row.client_socket_open ?? null,
+      placeable: daemonCanPlace(row.id),
     })
   }
 
@@ -770,7 +818,10 @@ async function runAgentReceiving() {
       `- last produced: ${entry.lastProducedAt || 'nothing on record'}`,
       `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
       `- daemon last saw the process ${entry.lastSeenAgoS}s ago${entry.socketOpen === null ? '' : `; own client socket ${entry.socketOpen ? 'open' : 'absent'}`}`,
-    ].join('\n')).join('\n\n')
+      entry.placeable === false
+        ? '- **no `permission_grants` row for this daemon — it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.** Recovery is `tmux kill-session` plus an operator wake.'
+        : entry.placeable === null ? '- daemon placement: not measured (ledger unreadable)' : null,
+    ].filter(Boolean).join('\n')).join('\n\n')
     const preface = hasActivityAt
       ? ''
       : '_Degraded: this server does not send `activity_at`, so every awake agent was queried instead of only the silent ones._\n\n'
