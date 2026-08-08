@@ -42,6 +42,7 @@ const MY_BOT = getManagedBots().find(b => String(b.name || '').toLowerCase() ===
 const CONFIG_NAME = getActiveEnvName(MY_BOT.environment)
 const FLEET_SERVER = getFleetServerUrl(MY_BOT.environment)
 const STORE_SERVER = getServerUrl(MY_BOT.environment)
+const WS_URL = FLEET_SERVER.replace(/^http/, 'ws') + '/ws/fleet'
 const BOT_ENVIRONMENTS = getManagedBotEnvironments()
 const ALLOWED_ENVIRONMENTS = Object.entries(BOT_ENVIRONMENTS)
   .filter(([, members]) => members.some(member => String(member).toLowerCase() === BOT_KEY))
@@ -241,6 +242,82 @@ export async function checkLinkedRemoteSafety({ force = false } = {}) {
   } finally {
     driver?.close()
     linkedRemoteProbeInFlight = false
+  }
+}
+
+// Restored from 5539b47^, unchanged in shape. The read-back is the whole point:
+// the send's own return value is not evidence the message arrived, and last
+// night's failures were precisely sends reported as delivered that never landed.
+// Anything that trusts `sent` and skips the history poll is not this check.
+async function checkMessageRoundTrip() {
+  const senderId = `fleet:dev-probe-${randomUUID().slice(0, 8)}`
+  const senderName = `dev-probe-${randomUUID().slice(0, 6)}`
+  const token = `dev-probe:${randomUUID()}`
+  let senderRegistered = false
+  try {
+    const payload = {
+      agent_id: senderId,
+      name: senderName,
+      cwd: REPO_ROOT,
+      labels: ['dev-probe'],
+      metadata: { bot_probe: BOT_KEY, disposable: true },
+    }
+    await sendRequest({ ...payload, type: 'reserve-shell' })
+    await sendRequest({ ...payload, type: 'login' })
+    senderRegistered = true
+    let sent
+    try {
+      sent = await sendRequest({ type: 'chat', from: senderId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
+    } catch (e) {
+      if (/No recipients matched/i.test(e?.message || '')) {
+        throw new ProbeSetupError(`round-trip bot recipient was not reachable (${AGENT_ID})`)
+      }
+      throw e
+    }
+    const ackEventIds = Array.isArray(sent?.event_ids) ? sent.event_ids : []
+    if (!ackEventIds.length) throw new Error('chat send did not return an accepted event id')
+    // `since` is mandatory, not a tidiness detail. fleet-search returns rows
+    // oldest-first, so an unbounded `limit: 30` reads this agent's history from
+    // July and can never contain the message just sent — the check would fail
+    // every sweep while delivery was perfectly healthy. The margin absorbs clock
+    // skew between this host and the server that stamps the row.
+    const since = new Date(Date.now() - 60_000).toISOString()
+    const deadline = Date.now() + REQUEST_TIMEOUT_MS
+    while (Date.now() < deadline) {
+      // The original read back through `chat-history`. That message type no
+      // longer exists; `fleet-search` is what serves thread() now, so the poll
+      // moves to it and the shape is unchanged — an independent read of the
+      // recipient's own history, never a re-inspection of the send's own ack.
+      const history = await sendRequest({
+        type: 'fleet-search',
+        query: '',
+        me: AGENT_ID,
+        agent: AGENT_ID,
+        agentOnly: true,
+        historyOnly: true,
+        eventOnly: true,
+        eventType: 'chat',
+        since,
+        limit: 30,
+      }, 5000)
+      const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
+      const found = events.find(event =>
+        (event.text || event.message) === token ||
+        ackEventIds.includes(Number(event.id || event.event_id)),
+      )
+      if (found) return { senderId, recipientId: AGENT_ID, eventId: found.id || found.event_id || null }
+      await new Promise(r => setTimeout(r, 500))
+    }
+    throw new Error('accepted chat did not arrive in dev bot chat history')
+  } finally {
+    if (senderRegistered) {
+      try {
+        await sendRequest({ type: 'mark-dead', agent: senderId }, 5000)
+      } catch (e) {
+        // Best-effort cleanup; failure is visible in logs for manual sweep.
+        console.error(`[dev-bot] disposable sender cleanup failed for ${senderId}: ${e.message}`)
+      }
+    }
   }
 }
 
@@ -451,10 +528,23 @@ function compactFailure(results) {
     .join('\n')
 }
 
+// The checks this bot is expected to run, declared separately from the table
+// below so that removing a check cannot silently shrink what `healthy` means.
+//
+// On 2026-07-29 `chat-roundtrip` was dropped from the table in a commit about
+// API migration. It was not disabled and not skipped — it stopped existing, and
+// because `checks:` is derived from whatever ran, the heartbeat went on saying
+// `healthy` with no way to tell it had stopped testing message delivery.
+//
+// A name here with no entry in the table below now reports `degraded` rather
+// than `healthy`. Removing a check is still allowed; removing it silently is not.
+const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety']
+
 async function runChecks() {
   const results = []
   for (const [name, check] of [
     ['doc-load', checkDocumentLoads],
+    ['chat-roundtrip', checkMessageRoundTrip],
     ['spawn-wake-seat', checkSpawnWakeSeat],
     ['linked-remote-safety', checkLinkedRemoteSafety],
   ]) {
@@ -475,14 +565,17 @@ async function runChecks() {
       })
     }
   }
+  const ran = new Set(results.map(r => r.name))
+  const missing = REQUIRED_CHECKS.filter(name => !ran.has(name))
   const failures = results.filter(r => !r.ok)
-  if (!failures.length) return { ok: true, results }
+  if (!failures.length) return { ok: true, results, missing }
   const setupFailures = failures.filter(r => r.setup)
   const testFailures = failures.filter(r => !r.setup)
   return {
     ok: false,
     setupOnly: testFailures.length === 0 && setupFailures.length > 0,
     results,
+    missing,
     summary: compactFailure(results),
   }
 }
@@ -541,7 +634,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: real document SVG load; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
+    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)
@@ -559,10 +652,16 @@ async function sweep() {
     if (report.ok) {
       if (lastFailureKey) writeHeartbeat('recovered')
       lastFailureKey = null
-      writeHeartbeat('healthy', {
+      const detail = {
         checks: report.results.filter(r => !r.skipped).map(r => r.name),
         skipped: report.results.filter(r => r.skipped).map(r => `${r.name}:${r.detail?.reason || 'skipped'}`),
-      })
+      }
+      // A required check with no implementation is not a healthy sweep. Everything
+      // that ran passed, so this is not a failure either — it is the bot saying it
+      // has stopped testing something, which is the state it previously could not
+      // express. See REQUIRED_CHECKS.
+      if (report.missing?.length) writeHeartbeat('degraded', { ...detail, missing: report.missing })
+      else writeHeartbeat('healthy', detail)
       return
     }
     if (report.setupOnly) {
