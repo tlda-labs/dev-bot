@@ -69,10 +69,11 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_STATUS_FILE` (statusFile; default: `"dev-bot-status.md"`) — Project-relative volatile status Markdown path.
 - `TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS` (agentSilenceWindowMs; default: `7200000`) — How long an agent may hold a delivered message without producing anything before it is reported silent.
 - `TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS` (agentSilenceLookbackMs; default: `86400000`) — How far back to look for the delivery that an agent is silent on.
-- `TLDA_DEV_BOT_AGENT_ALIVE_MAX_AGE_S` (agentAliveMaxAgeS; default: `600`) — Maximum last_seen age for the daemon to count as still reporting the process alive.
 - `TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS` (channelSilenceWindowMs; default: `600000`) — How long an awake agent may hold no open fleet socket before it is reported off-channel.
 - `TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED` (channelReportEnabled; default: `false`) — Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.
 - `TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS` (agentWatchIntervalMs; default: `300000`) — Cadence for the agent silence and channel checks, which each cost one whole-roster read.
+- `TLDA_DEV_BOT_SERVER_IMPORTS_REPO` (serverImportsRepo; default: `""`) — tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.
+- `TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS` (serverImportsIntervalMs; default: `600000`) — Cadence for the server import resolution check.
 - `TLDA_DEV_BOT_ROSTER_TIMEOUT_MS` (rosterTimeoutMs; default: `90000`) — Timeout for a whole-roster read, which is far slower than an ordinary fleet request.
 <!-- END GENERATED CONFIG -->
 

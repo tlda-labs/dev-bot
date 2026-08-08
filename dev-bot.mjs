@@ -26,6 +26,7 @@ import {
 } from '@tlda/bot'
 import { labelsForAgent, reapIdlePreviews } from '@tlda/bot'
 import { createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
+import { checkServerImports, describeServerImportFailures } from './server-import-resolution.mjs'
 import { createGitRemoteProbeDriver, runLinkedRemoteProbe } from './linked-remote-probe.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -78,6 +79,8 @@ export const configSchema = defineConfig({
   channelSilenceWindowMs: { env: 'TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS', default: 600_000, description: 'How long an awake agent may hold no open fleet socket before it is reported off-channel.', parse: configTypes.integer, validate: positive },
   channelReportEnabled: { env: 'TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED', default: false, description: 'Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.', parse: configTypes.boolean },
   agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence and channel checks, which each cost one whole-roster read.', parse: configTypes.integer, validate: positive },
+  serverImportsRepo: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_REPO', default: '', description: 'tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.', parse: configTypes.string },
+  serverImportsIntervalMs: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS', default: 600_000, description: 'Cadence for the server import resolution check.', parse: configTypes.integer, validate: positive },
   rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
 })
 const config = parseConfig(configSchema)
@@ -95,6 +98,7 @@ const {
   channelSilenceWindowMs: CHANNEL_SILENCE_WINDOW_MS,
   channelReportEnabled: CHANNEL_REPORT_ENABLED,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
+  serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
 } = config
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
@@ -845,6 +849,44 @@ async function runAgentChannel() {
   return { ...detail, reporting: true }
 }
 
+// The only check here that is not about a running system. It is a static read of
+// a checkout, and it belongs beside the others because its failure mode is the
+// same shape: a deploy that crash-loops in production while `tsc`, the local
+// import check and the test suite all pass, because all three resolve against
+// the root `node_modules` and the image installs from `server/package.json`.
+// Eleven minutes of testing downtime on 2026-08-08, over one package.
+let lastServerImportsAt = 0
+let lastServerImportsResult = null
+
+export async function checkServerImportResolution() {
+  if (!SERVER_IMPORTS_REPO) return { skipped: true, reason: 'no repo configured' }
+  const now = Date.now()
+  if (lastServerImportsAt && now - lastServerImportsAt < SERVER_IMPORTS_INTERVAL_MS) {
+    if (lastServerImportsResult?.error) throw new Error(lastServerImportsResult.error)
+    return { ...(lastServerImportsResult?.value || {}), cached: true }
+  }
+  lastServerImportsAt = now
+  let report
+  try {
+    report = checkServerImports({ repoRoot: SERVER_IMPORTS_REPO })
+  } catch (e) {
+    // A checkout that cannot be read is a setup problem, not a finding. Saying
+    // "no missing imports" here would be the check reporting a pass it did not
+    // perform, which is how the round-trip check read healthy for ten days.
+    lastServerImportsResult = null
+    lastServerImportsAt = 0
+    throw new ProbeSetupError(`server import check could not read ${SERVER_IMPORTS_REPO}: ${e.message}`)
+  }
+  if (report.missing.length || report.unshipped.length || report.unresolved.length) {
+    const message = `${describeServerImportFailures(report)}\n\nChecked \`${SERVER_IMPORTS_REPO}\`, ${report.reachable} files on the boot path.`
+    lastServerImportsResult = { error: message }
+    throw new Error(message)
+  }
+  const value = { repo: SERVER_IMPORTS_REPO, reachable: report.reachable, declared: report.declared }
+  lastServerImportsResult = { value }
+  return value
+}
+
 function compactFailure(results) {
   return results
     .filter(r => !r.ok)
@@ -862,7 +904,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'agent-channel']
+const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'agent-channel', 'server-imports']
 
 async function runChecks() {
   const results = []
@@ -873,6 +915,7 @@ async function runChecks() {
     ['linked-remote-safety', checkLinkedRemoteSafety],
     ['agent-receiving', checkAgentReceiving],
     ['agent-channel', checkAgentChannel],
+    ['server-imports', checkServerImportResolution],
   ]) {
     try {
       const detail = await check()
