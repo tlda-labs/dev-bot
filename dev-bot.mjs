@@ -130,6 +130,56 @@ let sweepInFlight = false
 // "still failing, unchanged for N minutes" and backs off.
 const FAILURE_REPEAT_SCHEDULE_MS = [5, 10, 20, 40, 60].map(minutes => minutes * 60_000)
 let activeFailure = null // { key, firstAt, lastNudgeAt, repeats, summary }
+
+// Restored from the heartbeat at startup, because this state decides two things
+// that a restart otherwise silently gets wrong: the backoff resets to five
+// minutes, and -- worse -- a failure that clears while the bot is restarting is
+// never announced, because the new process has no memory of having raised it.
+//
+// That happened on 2026-08-08: `grammar` went down, was nudged, and recovered
+// across a restart of this bot. Nobody was told it cleared, and I had already
+// promised on-call that they would be. A recovery notice that a restart can eat
+// is not a recovery notice, and this bot restarts often.
+//
+// The heartbeat is append-only and already carries every field needed, so this
+// reads it rather than adding a second state file to disagree with it. Only the
+// tail is read; the file is megabytes.
+function restoreActiveFailure() {
+  let tail
+  try {
+    const { size } = fs.statSync(HEARTBEAT_FILE)
+    const start = Math.max(0, size - 256 * 1024)
+    const fd = fs.openSync(HEARTBEAT_FILE, 'r')
+    const buffer = Buffer.alloc(size - start)
+    fs.readSync(fd, buffer, 0, buffer.length, start)
+    fs.closeSync(fd)
+    tail = buffer.toString('utf8')
+  } catch {
+    return null
+  }
+  for (const line of tail.split('\n').reverse()) {
+    if (!line.trim()) continue
+    let entry
+    try {
+      entry = JSON.parse(line)
+    } catch {
+      // A truncated first line from the offset read, or a partial append.
+      continue
+    }
+    if (entry.reason === 'recovered') return null
+    if (entry.reason !== 'failure-nudged' || !entry.summary) continue
+    const at = Date.parse(entry.ts)
+    if (!Number.isFinite(at)) return null
+    return {
+      key: entry.summary,
+      summary: entry.summary,
+      firstAt: at - (Number(entry.standingForMin) || 0) * 60_000,
+      lastNudgeAt: at,
+      repeats: Number(entry.repeats) || 0,
+    }
+  }
+  return null
+}
 const playwrightPoolCleanup = createPlaywrightPoolCleanup()
 const worktreeCleanup = createWorktreeCleanup()
 let resourceCleanupTimer = null
@@ -1395,7 +1445,11 @@ if (process.env.TLDA_DEV_BOT_NO_START !== '1') {
     cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
   }).start()
 
-  writeHeartbeat('startup', { intervalMs: INTERVAL_MS })
+  activeFailure = restoreActiveFailure()
+  writeHeartbeat('startup', {
+    intervalMs: INTERVAL_MS,
+    ...(activeFailure ? { restoredFailure: activeFailure.summary.split('\n')[0], repeats: activeFailure.repeats } : {}),
+  })
   resourceCleanupTimer = setInterval(() => cleanupResources().catch(e => console.error('[dev-bot] resource cleanup failed:', e.message)), RESOURCE_CLEANUP_INTERVAL_MS)
   resourceCleanupTimer.unref?.()
 }
