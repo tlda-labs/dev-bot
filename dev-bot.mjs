@@ -755,7 +755,7 @@ async function runAgentReceiving() {
       lastSeenAgoS: row.last_seen_ago_s,
       activity: row.activity || null,
       tool: row.tool || null,
-      socketOpen: row.fleet_socket_open ?? null,
+      socketOpen: row.client_socket_open ?? null,
     })
   }
 
@@ -769,7 +769,7 @@ async function runAgentReceiving() {
       `- holding a message from \`${entry.from}\` delivered ${entry.deliveredAt}`,
       `- last produced: ${entry.lastProducedAt || 'nothing on record'}`,
       `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
-      `- daemon last saw the process ${entry.lastSeenAgoS}s ago${entry.socketOpen === null ? '' : `; fleet socket ${entry.socketOpen ? 'open' : 'absent'}`}`,
+      `- daemon last saw the process ${entry.lastSeenAgoS}s ago${entry.socketOpen === null ? '' : `; own client socket ${entry.socketOpen ? 'open' : 'absent'}`}`,
     ].join('\n')).join('\n\n')
     const preface = hasActivityAt
       ? ''
@@ -779,11 +779,17 @@ async function runAgentReceiving() {
   return { watched: rows.length, queried: candidates.length, windowMin: Math.round(AGENT_SILENCE_WINDOW_MS / 60_000) }
 }
 
-// An agent that is merely busy inside a long tool call still holds its fleet
-// socket — ResilientWS heartbeats every 45s independently of the model. An
-// agent whose client wedged, died, or never initialised does not. That is the
+// An agent that is merely busy inside a long tool call still holds its own
+// client socket — ResilientWS heartbeats every 45s independently of the model.
+// An agent whose client wedged, died, or never initialised does not. That is the
 // only fast discriminator available from outside, and it is why this exists
 // beside the slow check above rather than instead of it.
+//
+// It reads `client_socket_open`, NOT the `fleet_socket_open` this bot asked for
+// first. That one counted any socket labelled with the agent's id, and
+// `reserve-shell` labels the CALLER's socket when waking someone else — so two
+// agents with no tlda MCP at all read as connected on its first observation.
+// The rename is the whole correction; see the comment on hasOwnClientSocketForAgent.
 //
 // Absence has to persist: a reconnect leaves the socket briefly absent during
 // normal operation, so first-absence is recorded here and only an agent absent
@@ -805,9 +811,9 @@ export async function checkAgentChannel() {
 async function runAgentChannel() {
   const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
   if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
-  if (!rows.some(row => Object.hasOwn(row, 'fleet_socket_open'))) {
+  if (!rows.some(row => Object.hasOwn(row, 'client_socket_open'))) {
     channelAbsentSince.clear()
-    return { skipped: true, reason: 'server does not send fleet_socket_open' }
+    return { skipped: true, reason: 'server does not send client_socket_open' }
   }
 
   const now = Date.now()
@@ -815,7 +821,7 @@ async function runAgentChannel() {
   const offChannel = []
   for (const row of rows) {
     seen.add(row.id)
-    if (row.fleet_socket_open !== false) { channelAbsentSince.delete(row.id); continue }
+    if (row.client_socket_open !== false) { channelAbsentSince.delete(row.id); continue }
     if (!channelAbsentSince.has(row.id)) channelAbsentSince.set(row.id, now)
     const since = channelAbsentSince.get(row.id)
     if (now - since < CHANNEL_SILENCE_WINDOW_MS) continue
