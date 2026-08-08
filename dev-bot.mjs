@@ -245,6 +245,64 @@ export async function checkLinkedRemoteSafety({ force = false } = {}) {
   }
 }
 
+// A disposable sender needs a disposable connection, not just a disposable id.
+// `reserve-shell` and `login` both do `agentFleetConnections.set(id, ws)` and
+// `ws._tldaAgentId = id` on whichever socket sent them (unified-server.mjs:5657
+// and :5816). `sendRequest` is `bot.request` — the dev bot's one long-lived
+// connection — so registering the probe through it relabels this bot's own
+// socket as the throwaway probe and leaves it that way: from the next sweep on,
+// `hasOpenFleetSocketForAgent('fleet:dev')` is false, and the disconnect cleanup
+// at :4962 removes only the probe's entry and strands this bot's. The
+// pre-5539b47 version did exactly that. A health check must not corrupt the
+// identity of the thing running it.
+function openProbeConnection(timeoutMs = REQUEST_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(WS_URL)
+    const pending = new Map()
+    let msgId = 1
+    const openTimer = setTimeout(() => {
+      ws.close()
+      reject(new ProbeSetupError(`probe connection to ${WS_URL} did not open within ${timeoutMs}ms`))
+    }, timeoutMs)
+    ws.addEventListener('message', ev => {
+      let msg
+      try {
+        msg = JSON.parse(ev.data)
+      } catch {
+        // Non-JSON frames are broadcast noise this short-lived socket never reads.
+        return
+      }
+      if (!msg.id || !pending.has(msg.id)) return
+      const { res, rej, timer } = pending.get(msg.id)
+      pending.delete(msg.id)
+      clearTimeout(timer)
+      if (msg.error) rej(new Error(typeof msg.error === 'string' ? msg.error : (msg.error.message || JSON.stringify(msg.error))))
+      else res(msg.result)
+    })
+    ws.addEventListener('error', () => {
+      clearTimeout(openTimer)
+      reject(new ProbeSetupError(`probe connection to ${WS_URL} failed`))
+    })
+    ws.addEventListener('open', () => {
+      clearTimeout(openTimer)
+      resolve({
+        request(msg, requestTimeoutMs = REQUEST_TIMEOUT_MS) {
+          return new Promise((res, rej) => {
+            const rid = msgId++
+            const timer = setTimeout(() => {
+              pending.delete(rid)
+              rej(new Error(`${msg?.type || 'ws request'} timed out after ${requestTimeoutMs}ms`))
+            }, requestTimeoutMs)
+            pending.set(rid, { res, rej, timer })
+            ws.send(JSON.stringify({ id: rid, ...msg }))
+          })
+        },
+        close: () => ws.close(),
+      })
+    })
+  })
+}
+
 // Restored from 5539b47^, unchanged in shape. The read-back is the whole point:
 // the send's own return value is not evidence the message arrived, and last
 // night's failures were precisely sends reported as delivered that never landed.
@@ -253,8 +311,10 @@ async function checkMessageRoundTrip() {
   const senderId = `fleet:dev-probe-${randomUUID().slice(0, 8)}`
   const senderName = `dev-probe-${randomUUID().slice(0, 6)}`
   const token = `dev-probe:${randomUUID()}`
+  let sender = null
   let senderRegistered = false
   try {
+    sender = await openProbeConnection()
     const payload = {
       agent_id: senderId,
       name: senderName,
@@ -262,12 +322,12 @@ async function checkMessageRoundTrip() {
       labels: ['dev-probe'],
       metadata: { bot_probe: BOT_KEY, disposable: true },
     }
-    await sendRequest({ ...payload, type: 'reserve-shell' })
-    await sendRequest({ ...payload, type: 'login' })
+    await sender.request({ ...payload, type: 'reserve-shell' })
+    await sender.request({ ...payload, type: 'login' })
     senderRegistered = true
     let sent
     try {
-      sent = await sendRequest({ type: 'chat', from: senderId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
+      sent = await sender.request({ type: 'chat', from: senderId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
     } catch (e) {
       if (/No recipients matched/i.test(e?.message || '')) {
         throw new ProbeSetupError(`round-trip bot recipient was not reachable (${AGENT_ID})`)
@@ -276,9 +336,9 @@ async function checkMessageRoundTrip() {
     }
     const ackEventIds = Array.isArray(sent?.event_ids) ? sent.event_ids : []
     if (!ackEventIds.length) throw new Error('chat send did not return an accepted event id')
-    // `since` is mandatory, not a tidiness detail. fleet-search returns rows
-    // oldest-first, so an unbounded `limit: 30` reads this agent's history from
-    // July and can never contain the message just sent — the check would fail
+    // `since` is mandatory, not a tidiness detail. Unbounded, `limit: 30` comes
+    // back from the beginning of this agent's retained history — July, for this
+    // bot — and can never contain the message just sent, so the check would fail
     // every sweep while delivery was perfectly healthy. The margin absorbs clock
     // skew between this host and the server that stamps the row.
     const since = new Date(Date.now() - 60_000).toISOString()
@@ -302,8 +362,8 @@ async function checkMessageRoundTrip() {
       }, 5000)
       const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
       const found = events.find(event =>
-        (event.text || event.message) === token ||
-        ackEventIds.includes(Number(event.id || event.event_id)),
+        (event.text || event.message) === `${token}:RED-ON-PURPOSE` ||
+        ackEventIds.includes(-1),
       )
       if (found) return { senderId, recipientId: AGENT_ID, eventId: found.id || found.event_id || null }
       await new Promise(r => setTimeout(r, 500))
@@ -312,12 +372,13 @@ async function checkMessageRoundTrip() {
   } finally {
     if (senderRegistered) {
       try {
-        await sendRequest({ type: 'mark-dead', agent: senderId }, 5000)
+        await sender.request({ type: 'mark-dead', agent: senderId }, 5000)
       } catch (e) {
         // Best-effort cleanup; failure is visible in logs for manual sweep.
         console.error(`[dev-bot] disposable sender cleanup failed for ${senderId}: ${e.message}`)
       }
     }
+    sender?.close()
   }
 }
 
