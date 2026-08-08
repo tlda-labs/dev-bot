@@ -1011,13 +1011,31 @@ export async function checkBotHeartbeats() {
     else beating.push(name)
   }
 
-  if (silent.length) {
-    throw new Error(silent.map(entry => entry.never
-      ? `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has never written a heartbeat (\`${entry.file}\`). Running or not, nothing it does can be distinguished from doing nothing.`
-      : `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has not written a heartbeat for ${entry.staleMin} minutes (\`${entry.file}\`).`,
-    ).join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either start these or stop declaring them in \`bots.yaml\`; both clear this.`)
+  // "Stopped writing" and "never written" are different facts and reporting them
+  // in one sentence made them look alike. `grammar` HAD a heartbeat and lost it,
+  // which is a bot that went down. `teacher` has never written one because
+  // teacher-bot.mjs does not implement the convention at all -- it lives in a
+  // different repo and never picked it up -- while the process itself is alive
+  // and was observed riding out a deploy correctly.
+  //
+  // So only the first wakes anyone. The second is a missing instrument, and it
+  // degrades the sweep instead: this bot cannot say whether that bot is working,
+  // which is exactly what `degraded` already means here. Alarming on it would get
+  // the row silenced, and silencing it would record that a declared bot has no
+  // liveness instrument as though it were fine -- teacher is the bot Skip asked
+  // for by name this afternoon, and its being unmonitorable is worth knowing.
+  const stopped = silent.filter(entry => !entry.never)
+  const unmonitored = silent.filter(entry => entry.never).map(entry => entry.name)
+  if (stopped.length) {
+    throw new Error(stopped.map(entry =>
+      `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has not written a heartbeat for ${entry.staleMin} minutes (\`${entry.file}\`). It was beating before, so it stopped.`,
+    ).join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either start it or stop declaring it in \`bots.yaml\`; both clear this.`)
   }
-  return { declared: declared.length, beating }
+  return {
+    declared: declared.length,
+    beating,
+    ...(unmonitored.length ? { unmonitored, blocked: true, reason: `declared with no heartbeat instrument: ${unmonitored.join(', ')}` } : {}),
+  }
 }
 
 function compactFailure(results) {
@@ -1056,7 +1074,7 @@ async function runChecks() {
       if (detail?.skipped) {
         results.push({ name, ok: true, skipped: true, blocked: !!detail.blocked, detail })
       } else {
-        results.push({ name, ok: true, detail })
+        results.push({ name, ok: true, blocked: !!detail?.blocked, detail })
       }
     } catch (e) {
       results.push({
@@ -1080,6 +1098,8 @@ async function runChecks() {
   //
   // Cadence and disabled skips are NOT this. A check waiting for its next window
   // is working; a check that cannot run is not.
+  // Includes checks that RAN. A check can pass and still be blind to part of what
+  // it is supposed to cover, and that is a degraded sweep, not a healthy one.
   const blocked = results.filter(r => r.blocked && REQUIRED_CHECKS.includes(r.name))
     .map(r => `${r.name}:${r.detail?.reason || 'blocked'}`)
   const failures = results.filter(r => !r.ok)
