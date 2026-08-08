@@ -119,8 +119,17 @@ const AGENT_ID = `fleet:${BOT_KEY}`
 let bot = null
 let sweepTimer = null
 let sweepInFlight = false
-let lastFailureKey = null
-let lastFailureNudgeAt = 0
+// A standing failure is raised once and then repeated on a widening interval.
+// The old shape re-raised the identical sentence every FAILURE_COOLDOWN_MS
+// forever: on 2026-08-08 `grammar` was down with nobody able to recover it and
+// the same paragraph arrived many times in half an hour. That is precisely how
+// an alarm gets muted, and muting is how this bot's round-trip check died for
+// ten days -- so the repeat is the danger, not the alarm.
+//
+// A CHANGED summary is a new fact and raises immediately. An unchanged one says
+// "still failing, unchanged for N minutes" and backs off.
+const FAILURE_REPEAT_SCHEDULE_MS = [5, 10, 20, 40, 60].map(minutes => minutes * 60_000)
+let activeFailure = null // { key, firstAt, lastNudgeAt, repeats, summary }
 const playwrightPoolCleanup = createPlaywrightPoolCleanup()
 const worktreeCleanup = createWorktreeCleanup()
 let resourceCleanupTimer = null
@@ -963,6 +972,17 @@ export async function checkServerImportResolution() {
 // created, so "cannot measure" and "has been inert for a week" look identical.
 // Skipping it is the blindness this check exists to remove.
 //
+// LOAD-BEARING, do not "improve" this into reading service state. On 2026-08-08
+// `launchctl list | grep tlda.bot` returned NOTHING -- no bot service loaded at
+// all -- while todd, chat-lint, teacher and this bot were alive in tmux and
+// working, and `tlda bot status` simultaneously reported `dev service loaded,
+// state = running`. A service-state check would have reported all six bots down
+// while four of them worked. The heartbeat is the only surface here that tracks
+// whether a bot is doing anything, which is the question.
+//
+// "Declared and not beating" and "not running" are therefore different facts and
+// the tooling cannot currently tell them apart. This measures the first.
+//
 // Threshold: healthy bots here beat once a sweep. Observed on 2026-08-08, todd,
 // chat-lint and this bot were all 0 minutes stale; grammar was 11,525 minutes and
 // teacher and nobody had never written one. There is no middle of that
@@ -1126,7 +1146,11 @@ async function sendFailureNudge(report) {
   }
   const key = report.summary
   const now = Date.now()
-  if (key === lastFailureKey && now - lastFailureNudgeAt < FAILURE_COOLDOWN_MS) return
+  const unchanged = activeFailure?.key === key
+  if (unchanged) {
+    const wait = FAILURE_REPEAT_SCHEDULE_MS[Math.min(activeFailure.repeats, FAILURE_REPEAT_SCHEDULE_MS.length - 1)]
+    if (now - activeFailure.lastNudgeAt < Math.max(wait, FAILURE_COOLDOWN_MS)) return
+  }
   const { targets, fellBack } = await nudgeTargets()
   if (!targets.length) {
     writeHeartbeat('failure-no-targets', { summary: report.summary })
@@ -1136,11 +1160,15 @@ async function sendFailureNudge(report) {
     writeHeartbeat('failure-nudge-dry-run', { targets, summary: report.summary })
     return
   }
+  const standingFor = unchanged ? Math.round((now - activeFailure.firstAt) / 60_000) : 0
   const message = [
-    report.setupOnly ? '**dev noticer: probe setup needs repair**' : '**dev noticer: testing is failing**',
+    unchanged
+      ? `**dev noticer: still failing, unchanged for ${standingFor} minutes** (first raised ${new Date(activeFailure.firstAt).toISOString()})`
+      : report.setupOnly ? '**dev noticer: probe setup needs repair**' : '**dev noticer: testing is failing**',
     '',
     report.summary,
     '',
+    ...(unchanged ? ['_Nothing here has changed since the first notice. The next repeat is further out; a changed finding interrupts immediately._', ''] : []),
     ...(fellBack ? [`_Delivery degraded: ${fellBack}._`, ''] : []),
     `Environment: \`${CONFIG_NAME}\``,
     `Fleet: \`${FLEET_SERVER}\``,
@@ -1151,9 +1179,10 @@ async function sendFailureNudge(report) {
   for (const target of targets) {
     await sendChat(target, message)
   }
-  lastFailureKey = key
-  lastFailureNudgeAt = now
-  writeHeartbeat('failure-nudged', { targets, summary: report.summary })
+  activeFailure = unchanged
+    ? { ...activeFailure, lastNudgeAt: now, repeats: activeFailure.repeats + 1 }
+    : { key, firstAt: now, lastNudgeAt: now, repeats: 0, summary: report.summary }
+  writeHeartbeat('failure-nudged', { targets, summary: report.summary, repeats: activeFailure.repeats, standingForMin: standingFor })
 }
 
 async function sweep() {
@@ -1162,8 +1191,19 @@ async function sweep() {
   try {
     const report = await runChecks()
     if (report.ok) {
-      if (lastFailureKey) writeHeartbeat('recovered')
-      lastFailureKey = null
+      // Backoff makes silence ambiguous — a reader cannot tell a cleared failure
+      // from one whose next repeat is forty minutes out. One line closes it. This
+      // is the only message this bot sends about something being fine, and it is
+      // sent only to people who were told it was broken.
+      if (activeFailure) {
+        const cleared = activeFailure
+        activeFailure = null
+        writeHeartbeat('recovered', { summary: cleared.summary, standingForMin: Math.round((Date.now() - cleared.firstAt) / 60_000) })
+        const { targets } = await nudgeTargets()
+        for (const target of targets) {
+          await sendChat(target, `**dev noticer: cleared** after ${Math.round((Date.now() - cleared.firstAt) / 60_000)} minutes.\n\n${cleared.summary.split('\n')[0]}`)
+        }
+      }
       const detail = {
         checks: report.results.filter(r => !r.skipped).map(r => r.name),
         skipped: report.results.filter(r => r.skipped).map(r => `${r.name}:${r.detail?.reason || 'skipped'}`),
