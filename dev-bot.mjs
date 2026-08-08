@@ -864,7 +864,7 @@ async function runAgentChannel() {
   if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
   if (!rows.some(row => Object.hasOwn(row, 'client_socket_open'))) {
     channelAbsentSince.clear()
-    return { skipped: true, reason: 'server does not send client_socket_open' }
+    return { skipped: true, blocked: true, reason: 'server does not send client_socket_open' }
   }
 
   const now = Date.now()
@@ -916,7 +916,7 @@ let lastServerImportsAt = 0
 let lastServerImportsResult = null
 
 export async function checkServerImportResolution() {
-  if (!SERVER_IMPORTS_REPO) return { skipped: true, reason: 'no repo configured' }
+  if (!SERVER_IMPORTS_REPO) return { skipped: true, blocked: true, reason: 'no repo configured' }
   const now = Date.now()
   if (lastServerImportsAt && now - lastServerImportsAt < SERVER_IMPORTS_INTERVAL_MS) {
     if (lastServerImportsResult?.error) throw new Error(lastServerImportsResult.error)
@@ -977,7 +977,7 @@ async function runChecks() {
     try {
       const detail = await check()
       if (detail?.skipped) {
-        results.push({ name, ok: true, skipped: true, detail })
+        results.push({ name, ok: true, skipped: true, blocked: !!detail.blocked, detail })
       } else {
         results.push({ name, ok: true, detail })
       }
@@ -993,8 +993,20 @@ async function runChecks() {
   }
   const ran = new Set(results.map(r => r.name))
   const missing = REQUIRED_CHECKS.filter(name => !ran.has(name))
+  // A required check that CANNOT run is not a healthy sweep either. `missing`
+  // catches a check deleted from the table; it does not catch one that is
+  // present, returns cleanly every sweep, and has never tested anything --
+  // because its server field is absent, or its repo is unconfigured. That reads
+  // `healthy` with a line in the skipped list, which is the shape of the failure
+  // this bot already had once: `healthy` printed identically for ten days while
+  // the round-trip check tested nothing.
+  //
+  // Cadence and disabled skips are NOT this. A check waiting for its next window
+  // is working; a check that cannot run is not.
+  const blocked = results.filter(r => r.blocked && REQUIRED_CHECKS.includes(r.name))
+    .map(r => `${r.name}:${r.detail?.reason || 'blocked'}`)
   const failures = results.filter(r => !r.ok)
-  if (!failures.length) return { ok: true, results, missing }
+  if (!failures.length) return { ok: true, results, missing, blocked }
   const setupFailures = failures.filter(r => r.setup)
   const testFailures = failures.filter(r => !r.setup)
   return {
@@ -1002,6 +1014,7 @@ async function runChecks() {
     setupOnly: testFailures.length === 0 && setupFailures.length > 0,
     results,
     missing,
+    blocked,
     summary: compactFailure(results),
   }
 }
@@ -1102,8 +1115,9 @@ async function sweep() {
       // that ran passed, so this is not a failure either — it is the bot saying it
       // has stopped testing something, which is the state it previously could not
       // express. See REQUIRED_CHECKS.
-      if (report.missing?.length) writeHeartbeat('degraded', { ...detail, missing: report.missing })
-      else writeHeartbeat('healthy', detail)
+      if (report.missing?.length || report.blocked?.length) {
+        writeHeartbeat('degraded', { ...detail, missing: report.missing, blocked: report.blocked })
+      } else writeHeartbeat('healthy', detail)
       return
     }
     if (report.setupOnly) {
