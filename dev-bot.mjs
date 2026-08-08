@@ -73,6 +73,11 @@ export const configSchema = defineConfig({
   resourceCleanupIntervalMs: { env: 'TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS', default: 60_000, description: 'Playwright cleanup cadence.', parse: configTypes.integer, validate: positive },
   worktreeCleanupIntervalMs: { env: 'TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS', default: 3_600_000, description: 'Worktree cleanup cadence.', parse: configTypes.integer, validate: positive },
   statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
+  agentSilenceWindowMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS', default: 7_200_000, description: 'How long an agent may hold a delivered message without producing anything before it is reported silent.', parse: configTypes.integer, validate: positive },
+  agentSilenceLookbackMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS', default: 86_400_000, description: 'How far back to look for the delivery that an agent is silent on.', parse: configTypes.integer, validate: positive },
+  agentAliveMaxAgeS: { env: 'TLDA_DEV_BOT_AGENT_ALIVE_MAX_AGE_S', default: 600, description: 'Maximum last_seen age for the daemon to count as still reporting the process alive.', parse: configTypes.integer, validate: positive },
+  channelSilenceWindowMs: { env: 'TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS', default: 600_000, description: 'How long an awake agent may hold no open fleet socket before it is reported off-channel.', parse: configTypes.integer, validate: positive },
+  channelReportEnabled: { env: 'TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED', default: false, description: 'Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.', parse: configTypes.boolean },
 })
 const config = parseConfig(configSchema)
 const {
@@ -85,6 +90,9 @@ const {
   assetPathOverride: ASSET_PATH_OVERRIDE, allowNondefault: ALLOW_NONDEFAULT, nudgeTo: NUDGE_TO_OVERRIDE,
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
+  agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
+  agentAliveMaxAgeS: AGENT_ALIVE_MAX_AGE_S, channelSilenceWindowMs: CHANNEL_SILENCE_WINDOW_MS,
+  channelReportEnabled: CHANNEL_REPORT_ENABLED,
 } = config
 
 if (!ALLOW_NONDEFAULT && !ALLOWED_ENVIRONMENTS.includes(CONFIG_NAME)) {
@@ -582,6 +590,195 @@ export async function checkSpawnWakeSeat({
   }
 }
 
+// ---- Agents that have stopped ----
+//
+// Both checks below live entirely outside the agent they are about. That is the
+// requirement, not a preference: when an agent's MCP client wedges or never
+// initialises, nothing the agent can do will report it — every self-report path
+// is the path that broke. So the evidence is server-side state only.
+//
+// Three independent facts about one agent, all on the fleet table row:
+//   last_seen      the daemon watching the process   -> the process is up
+//   activity_at    the agent's own MCP client        -> when it last reached us
+//   fleet_socket_open  the server's socket registry  -> is the client attached
+//
+// `activity_at` and `fleet_socket_open` were added to the row for these checks
+// (tlda 99a308836). An older server omits them and the checks say so rather
+// than reading the absence as a healthy answer.
+
+function rowIsWatchable(row) {
+  if (!row || row.human) return false
+  if (row.id === AGENT_ID || row.id === OWNER_ID) return false
+  if (row.id?.startsWith?.('fleet:dev-probe-')) return false
+  return !(Array.isArray(row.labels) && row.labels.includes('bot'))
+}
+
+async function fleetTableRows(filter) {
+  const data = await fetchJson(FLEET_SERVER, `/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`)
+  return Array.isArray(data?.agents) ? data.agents : []
+}
+
+async function botSenderIds() {
+  const rows = await fleetTableRows('bot')
+  return new Set(rows.map(row => row.id).filter(Boolean))
+}
+
+// The agent's own most recent PRODUCED entry. Role 'assistant' is the point: a
+// message delivered to an agent writes a `user` entry the moment it lands, so
+// counting any entry would let the delivery itself stand as evidence that the
+// agent reacted to the delivery.
+async function lastProducedAt(agentId) {
+  const result = await sendRequest({
+    type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId,
+    historyOnly: true, role: 'assistant', limit: 1,
+  }, 10_000)
+  const rows = (Array.isArray(result?.results) ? result.results : []).filter(r => r.source === 'session')
+  return rows[0]?.timestamp || null
+}
+
+// The most recent chat this agent RECEIVED from something that is not a bot and
+// not itself. Bot senders are excluded by sender id, not by guessing at text:
+// over three days of testing history, todd check-ins and build notices were 15
+// of the 37 raw instances of this condition and every one of them was benign.
+// An agent does not owe a bot nudge a reaction.
+async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
+  const result = await sendRequest({
+    type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId, agentOnly: true,
+    historyOnly: true, eventOnly: true, eventType: 'chat', since: sinceIso, limit: 50,
+  }, 10_000)
+  const rows = (Array.isArray(result?.results) ? result.results : []).filter(r => r.source === 'fleet')
+  const received = rows.filter(row =>
+    row.from && row.from !== agentId && !botIds.has(row.from) &&
+    (Array.isArray(row.recipients) ? row.recipients.includes(agentId) : true))
+  received.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
+  return received[0] || null
+}
+
+export async function checkAgentReceiving() {
+  const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
+  if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
+
+  // Cheap pre-filter: an agent whose client reached us inside the window is
+  // demonstrably not silent, and asking the server about it is pure load.
+  const hasActivityAt = rows.some(row => Object.hasOwn(row, 'activity_at'))
+  const now = Date.now()
+  const candidates = hasActivityAt
+    ? rows.filter(row => {
+      const at = Date.parse(row.activity_at || '')
+      return !Number.isFinite(at) || now - at >= AGENT_SILENCE_WINDOW_MS
+    })
+    : rows
+
+  const botIds = await botSenderIds()
+  const sinceIso = new Date(now - AGENT_SILENCE_LOOKBACK_MS).toISOString()
+  const silent = []
+  for (const row of candidates) {
+    // The daemon must still be reporting the process. Without this the check
+    // reports every agent that simply exited, which is a different event with
+    // a different owner.
+    if (!Number.isFinite(row.last_seen_ago_s) || row.last_seen_ago_s > AGENT_ALIVE_MAX_AGE_S) continue
+    const delivery = await lastRealDeliveryTo(row.id, botIds, sinceIso)
+    if (!delivery?.timestamp) continue
+    const deliveredAt = Date.parse(delivery.timestamp)
+    // Not yet decidable: the window has not elapsed since the delivery.
+    if (!Number.isFinite(deliveredAt) || now - deliveredAt < AGENT_SILENCE_WINDOW_MS) continue
+    const produced = await lastProducedAt(row.id)
+    const producedAt = Date.parse(produced || '')
+    if (Number.isFinite(producedAt) && producedAt > deliveredAt) continue
+    silent.push({
+      id: row.id,
+      name: row.name || row.id,
+      silentForMin: Math.round((now - deliveredAt) / 60_000),
+      deliveredAt: delivery.timestamp,
+      from: delivery.from,
+      lastProducedAt: produced,
+      lastClientCallAt: row.activity_at ?? null,
+      lastSeenAgoS: row.last_seen_ago_s,
+      activity: row.activity || null,
+      tool: row.tool || null,
+      socketOpen: row.fleet_socket_open ?? null,
+    })
+  }
+
+  if (silent.length) {
+    // Deliberately does not name a mechanism. Wedged client, dead harness, an
+    // MCP that never initialised and a model stuck in a loop all present here
+    // identically, and an alarm that guesses between them sends the reader to
+    // the wrong place. Report the silence and the evidence; the pane says why.
+    const lines = silent.map(entry => [
+      `**${entry.name}** (\`${entry.id}\`) has produced nothing for ${entry.silentForMin} minutes.`,
+      `- holding a message from \`${entry.from}\` delivered ${entry.deliveredAt}`,
+      `- last produced: ${entry.lastProducedAt || 'nothing on record'}`,
+      `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
+      `- daemon last saw the process ${entry.lastSeenAgoS}s ago${entry.socketOpen === null ? '' : `; fleet socket ${entry.socketOpen ? 'open' : 'absent'}`}`,
+    ].join('\n')).join('\n\n')
+    const preface = hasActivityAt
+      ? ''
+      : '_Degraded: this server does not send `activity_at`, so every awake agent was queried instead of only the silent ones._\n\n'
+    throw new Error(`${preface}${lines}`)
+  }
+  return { watched: rows.length, queried: candidates.length, windowMin: Math.round(AGENT_SILENCE_WINDOW_MS / 60_000) }
+}
+
+// An agent that is merely busy inside a long tool call still holds its fleet
+// socket — ResilientWS heartbeats every 45s independently of the model. An
+// agent whose client wedged, died, or never initialised does not. That is the
+// only fast discriminator available from outside, and it is why this exists
+// beside the slow check above rather than instead of it.
+//
+// Absence has to persist: a reconnect leaves the socket briefly absent during
+// normal operation, so first-absence is recorded here and only an agent absent
+// for the whole window is reported.
+const channelAbsentSince = new Map()
+
+export async function checkAgentChannel() {
+  const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
+  if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
+  if (!rows.some(row => Object.hasOwn(row, 'fleet_socket_open'))) {
+    channelAbsentSince.clear()
+    return { skipped: true, reason: 'server does not send fleet_socket_open' }
+  }
+
+  const now = Date.now()
+  const seen = new Set()
+  const offChannel = []
+  for (const row of rows) {
+    seen.add(row.id)
+    if (row.fleet_socket_open !== false) { channelAbsentSince.delete(row.id); continue }
+    if (!Number.isFinite(row.last_seen_ago_s) || row.last_seen_ago_s > AGENT_ALIVE_MAX_AGE_S) continue
+    if (!channelAbsentSince.has(row.id)) channelAbsentSince.set(row.id, now)
+    const since = channelAbsentSince.get(row.id)
+    if (now - since < CHANNEL_SILENCE_WINDOW_MS) continue
+    offChannel.push({
+      id: row.id,
+      name: row.name || row.id,
+      absentForMin: Math.round((now - since) / 60_000),
+      lastClientCallAt: row.activity_at ?? null,
+      lastSeenAgoS: row.last_seen_ago_s,
+      activity: row.activity || null,
+      tool: row.tool || null,
+    })
+  }
+  for (const id of [...channelAbsentSince.keys()]) if (!seen.has(id)) channelAbsentSince.delete(id)
+
+  const detail = { watched: rows.length, offChannel: offChannel.map(entry => `${entry.name}:${entry.absentForMin}m`) }
+  // Observation only until the live false-positive rate is measured. The count
+  // is written to the heartbeat every sweep so the rate is measurable without
+  // anyone being nudged in the meantime.
+  if (!CHANNEL_REPORT_ENABLED) {
+    writeHeartbeat('channel-observation', detail)
+    return { ...detail, reporting: false }
+  }
+  if (offChannel.length) {
+    throw new Error(offChannel.map(entry => [
+      `**${entry.name}** (\`${entry.id}\`) has held no fleet socket for ${entry.absentForMin} minutes while its process is reported alive.`,
+      `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
+      `- daemon last saw the process ${entry.lastSeenAgoS}s ago`,
+    ].join('\n')).join('\n\n'))
+  }
+  return { ...detail, reporting: true }
+}
+
 function compactFailure(results) {
   return results
     .filter(r => !r.ok)
@@ -599,7 +796,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety']
+const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'agent-channel']
 
 async function runChecks() {
   const results = []
@@ -608,6 +805,8 @@ async function runChecks() {
     ['chat-roundtrip', checkMessageRoundTrip],
     ['spawn-wake-seat', checkSpawnWakeSeat],
     ['linked-remote-safety', checkLinkedRemoteSafety],
+    ['agent-receiving', checkAgentReceiving],
+    ['agent-channel', checkAgentChannel],
   ]) {
     try {
       const detail = await check()
@@ -649,13 +848,28 @@ function isNudgeTarget(agent) {
   return true
 }
 
+// An alarm delivered to nobody is not an alarm. Addressing `awake & on-call`
+// alone means that when every holder of the label is hibernating -- which was
+// true of all three holders on 2026-08-08, for 8, 94 and 371 hours -- a correct
+// failure notice is written to a heartbeat and reaches no one.
+//
+// So: awake holders when there are any; otherwise the hibernating holders, whose
+// delivery queues until they wake. The fallback is NOT silent -- `fellBack` is
+// carried into the notice text, because a fallback that fixes today and hides
+// tomorrow is how the label rotted unnoticed in the first place.
 async function nudgeTargets() {
-  if (NUDGE_TO_OVERRIDE) return [NUDGE_TO_OVERRIDE]
-  if (!NUDGE_LABEL) return []
-  const filter = encodeURIComponent(`awake & ${NUDGE_LABEL}`)
-  const data = await fetchJson(FLEET_SERVER, `/api/fleet-table?filter=${filter}&limit=500`)
-  const agents = Array.isArray(data?.agents) ? data.agents : []
-  return agents.filter(isNudgeTarget).map(agent => agent.id)
+  if (NUDGE_TO_OVERRIDE) return { targets: [NUDGE_TO_OVERRIDE], fellBack: null }
+  if (!NUDGE_LABEL) return { targets: [], fellBack: null }
+  const holders = async filter => {
+    const data = await fetchJson(FLEET_SERVER, `/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`)
+    const agents = Array.isArray(data?.agents) ? data.agents : []
+    return agents.filter(isNudgeTarget).map(agent => agent.id)
+  }
+  const awake = await holders(`awake & ${NUDGE_LABEL}`)
+  if (awake.length) return { targets: awake, fellBack: null }
+  const asleep = await holders(NUDGE_LABEL)
+  if (!asleep.length) return { targets: [], fellBack: null }
+  return { targets: asleep, fellBack: `no awake holder of \`${NUDGE_LABEL}\`; queued to ${asleep.length} hibernating holder(s)` }
 }
 
 async function sendChat(to, message) {
@@ -677,7 +891,7 @@ async function sendFailureNudge(report) {
   const key = report.summary
   const now = Date.now()
   if (key === lastFailureKey && now - lastFailureNudgeAt < FAILURE_COOLDOWN_MS) return
-  const targets = await nudgeTargets()
+  const { targets, fellBack } = await nudgeTargets()
   if (!targets.length) {
     writeHeartbeat('failure-no-targets', { summary: report.summary })
     return
@@ -691,6 +905,7 @@ async function sendFailureNudge(report) {
     '',
     report.summary,
     '',
+    ...(fellBack ? [`_Delivery degraded: ${fellBack}._`, ''] : []),
     `Environment: \`${CONFIG_NAME}\``,
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,

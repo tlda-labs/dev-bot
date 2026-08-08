@@ -67,6 +67,11 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS` (resourceCleanupIntervalMs; default: `60000`) — Playwright cleanup cadence.
 - `TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS` (worktreeCleanupIntervalMs; default: `3600000`) — Worktree cleanup cadence.
 - `TLDA_DEV_BOT_STATUS_FILE` (statusFile; default: `"dev-bot-status.md"`) — Project-relative volatile status Markdown path.
+- `TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS` (agentSilenceWindowMs; default: `7200000`) — How long an agent may hold a delivered message without producing anything before it is reported silent.
+- `TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS` (agentSilenceLookbackMs; default: `86400000`) — How far back to look for the delivery that an agent is silent on.
+- `TLDA_DEV_BOT_AGENT_ALIVE_MAX_AGE_S` (agentAliveMaxAgeS; default: `600`) — Maximum last_seen age for the daemon to count as still reporting the process alive.
+- `TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS` (channelSilenceWindowMs; default: `600000`) — How long an awake agent may hold no open fleet socket before it is reported off-channel.
+- `TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED` (channelReportEnabled; default: `false`) — Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.
 <!-- END GENERATED CONFIG -->
 
 The shared harness also honors `TLDA_BOT_NAME`, `TLDA_BOT_PIDFILE`,
