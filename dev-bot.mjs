@@ -362,8 +362,8 @@ async function checkMessageRoundTrip() {
       }, 5000)
       const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
       const found = events.find(event =>
-        (event.text || event.message) === `${token}:RED-ON-PURPOSE` ||
-        ackEventIds.includes(-1),
+        (event.text || event.message) === token ||
+        ackEventIds.includes(Number(event.id || event.event_id)),
       )
       if (found) return { senderId, recipientId: AGENT_ID, eventId: found.id || found.event_id || null }
       await new Promise(r => setTimeout(r, 500))
