@@ -82,6 +82,7 @@ export const configSchema = defineConfig({
   agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence and channel checks, which each cost one whole-roster read.', parse: configTypes.integer, validate: positive },
   serverImportsRepo: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_REPO', default: '', description: 'tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.', parse: configTypes.string },
   serverImportsIntervalMs: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS', default: 600_000, description: 'Cadence for the server import resolution check.', parse: configTypes.integer, validate: positive },
+  botHeartbeatStaleMs: { env: 'TLDA_DEV_BOT_BOT_HEARTBEAT_STALE_MS', default: 900_000, description: 'How long a bot declared for this environment may go without writing a heartbeat before it is reported inert.', parse: configTypes.integer, validate: positive },
   daemonLedgerDb: { env: 'TLDA_DEV_BOT_DAEMON_LEDGER_DB', default: path.join(CONFIG_DIR, 'fleet-daemon.db'), description: 'Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.', parse: configTypes.string },
   rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
 })
@@ -101,7 +102,7 @@ const {
   channelReportEnabled: CHANNEL_REPORT_ENABLED,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
   serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
-  daemonLedgerDb: DAEMON_LEDGER_DB,
+  daemonLedgerDb: DAEMON_LEDGER_DB, botHeartbeatStaleMs: BOT_HEARTBEAT_STALE_MS,
 } = config
 const DAEMON_KEY = process.env.FLEET_DAEMON_KEY || `${process.env.TLDA_BOT_MACHINE_ID || process.env.TLDA_MACHINE_ID || ''}:${CONFIG_NAME}`
 
@@ -944,6 +945,61 @@ export async function checkServerImportResolution() {
   return value
 }
 
+
+// The fourth failure of 2026-08-08: the teacher bot sat inert for seven days and
+// the only trace was one line in a log nobody reads. A bot that is up and doing
+// nothing is indistinguishable from a working one unless something outside it
+// looks, and every bot here already writes an append-only heartbeat per sweep.
+//
+// The declared bot list for this environment is the contract. A bot named in
+// `bots.yaml` under this environment is supposed to be running, so one that is
+// not beating is a defect with an action attached: start it, or stop declaring
+// it. That is why a stopped-on-purpose bot is NOT treated as a false positive —
+// the alarm clears either way, and the alternative is a watcher that cannot tell
+// "deliberately off" from "died in July".
+//
+// An absent heartbeat file is a finding, not an excuse to skip. The teacher bot
+// is the case: its process sets TLDA_BOT_HEARTBEAT and the file has never been
+// created, so "cannot measure" and "has been inert for a week" look identical.
+// Skipping it is the blindness this check exists to remove.
+//
+// Threshold: healthy bots here beat once a sweep. Observed on 2026-08-08, todd,
+// chat-lint and this bot were all 0 minutes stale; grammar was 11,525 minutes and
+// teacher and nobody had never written one. There is no middle of that
+// distribution, so 15 minutes sits far above every healthy value and far below
+// every failing one.
+export async function checkBotHeartbeats() {
+  const declared = (BOT_ENVIRONMENTS[CONFIG_NAME] || [])
+    .map(name => String(name).toLowerCase())
+    .filter(name => name !== BOT_KEY)
+  if (!declared.length) return { skipped: true, blocked: true, reason: `no bots declared for environment ${CONFIG_NAME}` }
+
+  const now = Date.now()
+  const silent = []
+  const beating = []
+  for (const name of declared) {
+    const file = path.join(CONFIG_DIR, `${name}.${CONFIG_NAME}.heartbeat`)
+    let mtimeMs = null
+    try {
+      mtimeMs = fs.statSync(file).mtimeMs
+    } catch {
+      silent.push({ name, file, never: true })
+      continue
+    }
+    const staleMs = now - mtimeMs
+    if (staleMs >= BOT_HEARTBEAT_STALE_MS) silent.push({ name, file, staleMin: Math.round(staleMs / 60_000) })
+    else beating.push(name)
+  }
+
+  if (silent.length) {
+    throw new Error(silent.map(entry => entry.never
+      ? `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has never written a heartbeat (\`${entry.file}\`). Running or not, nothing it does can be distinguished from doing nothing.`
+      : `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has not written a heartbeat for ${entry.staleMin} minutes (\`${entry.file}\`).`,
+    ).join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either start these or stop declaring them in \`bots.yaml\`; both clear this.`)
+  }
+  return { declared: declared.length, beating }
+}
+
 function compactFailure(results) {
   return results
     .filter(r => !r.ok)
@@ -961,7 +1017,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'agent-channel', 'server-imports']
+const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'agent-channel', 'server-imports', 'bot-heartbeats']
 
 async function runChecks() {
   const results = []
@@ -973,6 +1029,7 @@ async function runChecks() {
     ['agent-receiving', checkAgentReceiving],
     ['agent-channel', checkAgentChannel],
     ['server-imports', checkServerImportResolution],
+    ['bot-heartbeats', checkBotHeartbeats],
   ]) {
     try {
       const detail = await check()

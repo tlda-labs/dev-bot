@@ -74,6 +74,7 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS` (agentWatchIntervalMs; default: `300000`) — Cadence for the agent silence and channel checks, which each cost one whole-roster read.
 - `TLDA_DEV_BOT_SERVER_IMPORTS_REPO` (serverImportsRepo; default: `""`) — tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.
 - `TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS` (serverImportsIntervalMs; default: `600000`) — Cadence for the server import resolution check.
+- `TLDA_DEV_BOT_BOT_HEARTBEAT_STALE_MS` (botHeartbeatStaleMs; default: `900000`) — How long a bot declared for this environment may go without writing a heartbeat before it is reported inert.
 - `TLDA_DEV_BOT_DAEMON_LEDGER_DB` (daemonLedgerDb; default: `"/Users/skip/.config/tlda/fleet-daemon.db"`) — Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.
 - `TLDA_DEV_BOT_ROSTER_TIMEOUT_MS` (rosterTimeoutMs; default: `90000`) — Timeout for a whole-roster read, which is far slower than an ordinary fleet request.
 <!-- END GENERATED CONFIG -->
