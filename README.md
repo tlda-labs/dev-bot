@@ -1,10 +1,12 @@
 # tlda dev bot
 
-The dev bot monitors the configured testing environment with a real document-load
-probe and an opt-in disposable core phi probe across
-spawn/login/inbox/hibernate/delegate/wake/login/inbox. Healthy checks stay quiet. Failures notify eligible
-on-call agents. The bot also owns cleanup of idle Playwright sessions, merged
-clean worktrees, and over-budget worktree dependency caches.
+The dev bot monitors the configured testing environment with real stage-one
+feature checks: disposable fleet chat delivery confirmed by history readback,
+the real MCP login/inbox/chat/thread surface, declared bot heartbeat outcomes,
+and a disposable Markdown source push/build/render stamp. Healthy checks stay
+quiet. Failures notify eligible on-call agents. The bot also owns cleanup of
+idle Playwright sessions, merged clean worktrees, and over-budget worktree
+dependency caches.
 
 Its authority is limited to its configured non-stable environment, disposable
 probe agents and tasks, configured failure-notice recipients, local cleanup
@@ -115,8 +117,9 @@ Local verification:
 ```sh
 npm test
 node --check dev-bot.mjs
-TLDA_DEV_BOT_NO_START=1 node generate-docs.mjs --check
+npm run docs:check
 ```
 
-The remaining live proof is supervisor-owned login and heartbeat, `help`, one
-`status` command, and the browser-visible rendered status document.
+The remaining live proof is supervisor-owned login and heartbeat, one
+non-continuous stage-one sweep, `help`, one `status` command, and the
+browser-visible rendered status document.

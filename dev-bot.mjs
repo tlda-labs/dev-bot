@@ -256,6 +256,63 @@ async function fetchJsonMaybe(base, urlPath, { method = 'GET', body = undefined,
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
+function readHeartbeatTail(file, bytes = 256 * 1024) {
+  const { size } = fs.statSync(file)
+  const start = Math.max(0, size - bytes)
+  const fd = fs.openSync(file, 'r')
+  try {
+    const buffer = Buffer.alloc(size - start)
+    fs.readSync(fd, buffer, 0, buffer.length, start)
+    return buffer.toString('utf8')
+  } finally {
+    fs.closeSync(fd)
+  }
+}
+
+function parseLatestHeartbeat(file) {
+  const tail = readHeartbeatTail(file)
+  for (const line of tail.split('\n').reverse()) {
+    if (!line.trim()) continue
+    try {
+      const entry = JSON.parse(line)
+      return entry && typeof entry === 'object' ? entry : null
+    } catch (e) {
+      // Offset reads can start mid-line, and the writer can leave a partial
+      // final line. Keep walking until a complete JSON entry appears.
+      if (!(e instanceof SyntaxError)) throw e
+    }
+  }
+  return null
+}
+
+function heartbeatHasOutcome(entry) {
+  if (!entry || typeof entry !== 'object') return false
+  if (Array.isArray(entry.checks) && entry.checks.length) return true
+  if (Array.isArray(entry.results) && entry.results.length) return true
+  if (Object.hasOwn(entry, 'lastFleetEventId') && Number(entry.lastFleetEventId) > 0) return true
+  if (Object.hasOwn(entry, 'lastFleetEventAt') && Date.parse(entry.lastFleetEventAt)) return true
+  return ['healthy', 'degraded', 'failure-nudged', 'probe-setup-failed', 'probe-setup-suppressed', 'recovered'].includes(entry.reason)
+}
+
+function htmlPathForMarkdownSource(file) {
+  const clean = String(file || 'index.md').replace(/\\/g, '/').replace(/^\/+/, '')
+  if (clean === 'index.md' || clean === 'index.markdown') return 'index.html'
+  return clean.replace(/\.(md|markdown)$/i, '.html')
+}
+
+async function waitForProjectBuildSuccess(projectName, deadline, { fetcher = fetchJson } = {}) {
+  let lastStatus = null
+  while (Date.now() < deadline) {
+    lastStatus = await fetcher(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}/build/status`)
+    if (lastStatus?.status === 'success') return lastStatus
+    if (lastStatus?.status === 'error') {
+      throw new Error(`document build failed for ${projectName}: ${(lastStatus.errors || []).map(e => e.message || e.text || String(e)).join('; ') || lastStatus.log || 'build error'}`)
+    }
+    await sleep(500)
+  }
+  throw new ProbeIndeterminateError(`document build for ${projectName} did not finish; last status=${lastStatus?.status || 'unknown'}`)
+}
+
 function basenameNoExt(file) {
   return String(file || '').replace(/\.tex$/i, '').split('/').pop()
 }
@@ -265,7 +322,7 @@ function projectIsUsableSvg(project) {
   return format === 'svg' && Number(project?.pages) > 0 && project?.buildStatus !== 'building'
 }
 
-async function checkDocumentLoads() {
+export async function checkDocumentLoads() {
   const listed = await fetchJson(STORE_SERVER, '/api/projects')
   const projects = Array.isArray(listed?.projects) ? listed.projects : []
   const candidate = PROBE_DOC
@@ -286,6 +343,59 @@ async function checkDocumentLoads() {
   if (!res.ok) throw new Error(`doc asset ${assetPath} returned HTTP ${res.status}`)
   if (!/<svg[\s>]/i.test(text.slice(0, 1000))) throw new Error(`doc asset ${assetPath} did not return SVG content`)
   return { doc: project.name, assetPath, bytes: text.length }
+}
+
+export async function checkDocumentBuildLoop({
+  uuid = randomUUID,
+  fetcher = fetchJson,
+  fetchMaybe = fetchJsonMaybe,
+  rawFetch = fetch,
+  waitBuild = waitForProjectBuildSuccess,
+  now = () => Date.now(),
+  cleanup = async projectName => {
+    await fetchJsonMaybe(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}`, { method: 'DELETE', okStatuses: [404] })
+  },
+} = {}) {
+  const suffix = uuid().slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, '0')
+  const projectName = `dev-probe-build-${suffix}`
+  const mainFile = 'index.md'
+  const stamp = `dev-build-stamp-${uuid()}`
+  let created = false
+  try {
+    await fetcher(STORE_SERVER, '/api/projects', {
+      method: 'POST',
+      body: { name: projectName, title: projectName, mainFile, format: 'markdown' },
+    })
+    created = true
+    const authority = await fetcher(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}/source-authority`)
+    const push = await fetcher(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}/push`, {
+      method: 'POST',
+      body: {
+        files: [{ path: mainFile, content: `# Dev bot build probe\n\n${stamp}\n` }],
+        sourceManifest: [mainFile],
+        expectedRevision: authority?.currentRevision || null,
+        editedBy: AGENT_ID,
+      },
+    })
+    if (!push?.ok) throw new Error(`document source push was not accepted for ${projectName}: ${push?.error || JSON.stringify(push)}`)
+    const status = await waitBuild(projectName, now() + REQUEST_TIMEOUT_MS, { fetcher })
+    const outputPath = `/docs/${encodeURIComponent(projectName)}/${htmlPathForMarkdownSource(mainFile)}`
+    const res = await rawFetch(`${STORE_SERVER}${outputPath}?t=${now()}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    const html = await res.text()
+    if (!res.ok) throw new Error(`rendered document ${outputPath} returned HTTP ${res.status}`)
+    if (!html.includes(stamp)) {
+      throw new Error(`rendered document ${outputPath} did not contain version stamp ${stamp}`)
+    }
+    return { project: projectName, mainFile, outputPath, stamp, buildStatus: status.status, sourceRevision: push.sourceRevision || null }
+  } finally {
+    if (created) {
+      try {
+        await cleanup(projectName)
+      } catch (e) {
+        console.error(`[dev-bot] disposable document cleanup failed for ${projectName}: ${e.message}`)
+      }
+    }
+  }
 }
 
 let lastSpawnWakeProbeAt = 0
@@ -382,14 +492,21 @@ function openProbeConnection(timeoutMs = REQUEST_TIMEOUT_MS) {
 // the send's own return value is not evidence the message arrived, and last
 // night's failures were precisely sends reported as delivered that never landed.
 // Anything that trusts `sent` and skips the history poll is not this check.
-async function checkMessageRoundTrip() {
-  const senderId = `fleet:dev-probe-${randomUUID().slice(0, 8)}`
-  const senderName = `dev-probe-${randomUUID().slice(0, 6)}`
-  const token = `dev-probe:${randomUUID()}`
+export async function checkMessageRoundTrip({
+  uuid = randomUUID,
+  openConnection = openProbeConnection,
+  readHistory = null,
+  now = () => Date.now(),
+  cleanup = async (connection, senderId) => connection.request({ type: 'mark-dead', agent: senderId }, 5000),
+} = {}) {
+  const senderId = `fleet:dev-probe-${uuid().slice(0, 8)}`
+  const senderName = `dev-probe-${uuid().slice(0, 6)}`
+  const token = `dev-probe:${uuid()}`
   let sender = null
   let senderRegistered = false
   try {
-    sender = await openProbeConnection()
+    sender = await openConnection()
+    readHistory ||= sender.request.bind(sender)
     const payload = {
       agent_id: senderId,
       name: senderName,
@@ -416,14 +533,14 @@ async function checkMessageRoundTrip() {
     // bot — and can never contain the message just sent, so the check would fail
     // every sweep while delivery was perfectly healthy. The margin absorbs clock
     // skew between this host and the server that stamps the row.
-    const since = new Date(Date.now() - 60_000).toISOString()
-    const deadline = Date.now() + REQUEST_TIMEOUT_MS
-    while (Date.now() < deadline) {
+    const since = new Date(now() - 60_000).toISOString()
+    const deadline = now() + REQUEST_TIMEOUT_MS
+    while (now() < deadline) {
       // The original read back through `chat-history`. That message type no
       // longer exists; `fleet-search` is what serves thread() now, so the poll
       // moves to it and the shape is unchanged — an independent read of the
       // recipient's own history, never a re-inspection of the send's own ack.
-      const history = await sendRequest({
+      const history = await readHistory({
         type: 'fleet-search',
         query: '',
         me: AGENT_ID,
@@ -447,13 +564,88 @@ async function checkMessageRoundTrip() {
   } finally {
     if (senderRegistered) {
       try {
-        await sender.request({ type: 'mark-dead', agent: senderId }, 5000)
+        await cleanup(sender, senderId)
       } catch (e) {
         // Best-effort cleanup; failure is visible in logs for manual sweep.
         console.error(`[dev-bot] disposable sender cleanup failed for ${senderId}: ${e.message}`)
       }
     }
     sender?.close()
+  }
+}
+
+export async function checkMcpToolSurface({
+  uuid = randomUUID,
+  openConnection = openProbeConnection,
+  readThread = null,
+  cleanup = async (connection, agentId) => connection.request({ type: 'mark-dead', agent: agentId }, 5000),
+  now = () => Date.now(),
+} = {}) {
+  const suffix = uuid().slice(0, 8)
+  const agentId = `fleet:dev-mcp-probe-${suffix}`
+  const name = `dev-mcp-probe-${uuid().slice(0, 6)}`
+  const token = `dev-mcp-surface:${uuid()}`
+  let connection = null
+  let registered = false
+  try {
+    connection = await openConnection()
+    readThread ||= connection.request.bind(connection)
+    const payload = {
+      agent_id: agentId,
+      name,
+      cwd: REPO_ROOT,
+      labels: ['dev-probe'],
+      metadata: { bot_probe: BOT_KEY, disposable: true, mcp_surface: true },
+    }
+    await connection.request({ ...payload, type: 'reserve-shell' })
+    const login = await connection.request({ ...payload, type: 'login' })
+    registered = true
+    if (!login?.ok && !login?.agent) throw new Error(`login did not confirm a live agent (${JSON.stringify(login)})`)
+
+    const inbox = await connection.request({ type: 'my-task', agent: agentId, peek: true })
+    if (!inbox || typeof inbox !== 'object' || !inbox.counts) {
+      throw new Error('inbox did not return the MCP inbox shape')
+    }
+
+    const sent = await connection.request({ type: 'chat', from: agentId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
+    const ackEventIds = Array.isArray(sent?.event_ids) ? sent.event_ids : []
+    if (!ackEventIds.length) throw new Error('chat did not return an accepted event id')
+
+    const since = new Date(now() - 60_000).toISOString()
+    const deadline = now() + REQUEST_TIMEOUT_MS
+    while (now() < deadline) {
+      const history = await readThread({
+        type: 'fleet-search',
+        query: '',
+        me: AGENT_ID,
+        agent: AGENT_ID,
+        agentOnly: true,
+        historyOnly: true,
+        eventOnly: true,
+        eventType: 'chat',
+        since,
+        limit: 30,
+      }, 5000)
+      const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
+      const found = events.find(event =>
+        (event.text || event.message) === token ||
+        ackEventIds.includes(Number(event.id || event.event_id)),
+      )
+      if (found) {
+        return { agentId, login: true, inbox: true, chatEventId: ackEventIds[0], threadEventId: found.id || found.event_id || null }
+      }
+      await sleep(500)
+    }
+    throw new Error('thread readback did not contain the accepted MCP chat')
+  } finally {
+    if (registered) {
+      try {
+        await cleanup(connection, agentId)
+      } catch (e) {
+        console.error(`[dev-bot] disposable MCP probe cleanup failed for ${agentId}: ${e.message}`)
+      }
+    }
+    connection?.close?.()
   }
 }
 
@@ -1030,8 +1222,8 @@ export async function checkServerImportResolution() {
 // teacher and nobody had never written one. There is no middle of that
 // distribution, so 15 minutes sits far above every healthy value and far below
 // every failing one.
-export async function checkBotHeartbeats() {
-  const declared = (BOT_ENVIRONMENTS[CONFIG_NAME] || [])
+export async function checkBotHeartbeats({ readHeartbeat = parseLatestHeartbeat, stat = file => fs.statSync(file), declaredNames = BOT_ENVIRONMENTS[CONFIG_NAME] } = {}) {
+  const declared = (declaredNames || [])
     .map(name => String(name).toLowerCase())
     .filter(name => name !== BOT_KEY)
   if (!declared.length) return { skipped: true, blocked: true, reason: `no bots declared for environment ${CONFIG_NAME}` }
@@ -1039,17 +1231,23 @@ export async function checkBotHeartbeats() {
   const now = Date.now()
   const silent = []
   const beating = []
+  const deaf = []
+  const uninstrumented = []
   for (const name of declared) {
     const file = path.join(CONFIG_DIR, `${name}.${CONFIG_NAME}.heartbeat`)
     let mtimeMs = null
+    let entry = null
     try {
-      mtimeMs = fs.statSync(file).mtimeMs
+      mtimeMs = stat(file).mtimeMs
+      entry = readHeartbeat(file)
     } catch {
       silent.push({ name, file, never: true })
       continue
     }
     const staleMs = now - mtimeMs
     if (staleMs >= BOT_HEARTBEAT_STALE_MS) silent.push({ name, file, staleMin: Math.round(staleMs / 60_000) })
+    else if (Object.hasOwn(entry, 'lastFleetEventId') && Number(entry.lastFleetEventId) <= 0) deaf.push({ name, file, reason: entry.reason || 'unknown', lastFleetEventId: entry.lastFleetEventId })
+    else if (!heartbeatHasOutcome(entry)) uninstrumented.push(name)
     else beating.push(name)
   }
 
@@ -1073,10 +1271,20 @@ export async function checkBotHeartbeats() {
       `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has not written a heartbeat for ${entry.staleMin} minutes (\`${entry.file}\`). It was beating before, so it stopped.`,
     ).join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either start it or stop declaring it in \`bots.yaml\`; both clear this.`)
   }
+  if (deaf.length) {
+    throw new Error(deaf.map(entry =>
+      `**${entry.name}** is declared for \`${CONFIG_NAME}\` and wrote an outcome heartbeat, but it has not heard a fleet event (lastFleetEventId=${entry.lastFleetEventId}, reason=${entry.reason}, \`${entry.file}\`).`,
+    ).join('\n\n') + `\n\nBeating with outcomes: ${beating.length ? beating.join(', ') : 'none'}.`)
+  }
+  const blockedInstrumentation = [...unmonitored, ...uninstrumented]
   return {
     declared: declared.length,
     beating,
-    ...(unmonitored.length ? { unmonitored, blocked: true, reason: `declared with no heartbeat instrument: ${unmonitored.join(', ')}` } : {}),
+    ...(blockedInstrumentation.length ? {
+      unmonitored: blockedInstrumentation,
+      blocked: true,
+      reason: `declared with no outcome-bearing heartbeat instrument: ${blockedInstrumentation.join(', ')}`,
+    } : {}),
   }
 }
 
@@ -1097,18 +1305,15 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'server-imports', 'bot-heartbeats']
+const REQUIRED_CHECKS = ['chat-roundtrip', 'mcp-tool-surface', 'bot-heartbeats', 'document-build-loop']
 
 async function runChecks() {
   const results = []
   for (const [name, check] of [
-    ['doc-load', checkDocumentLoads],
     ['chat-roundtrip', checkMessageRoundTrip],
-    ['spawn-wake-seat', checkSpawnWakeSeat],
-    ['linked-remote-safety', checkLinkedRemoteSafety],
-    ['agent-receiving', checkAgentReceiving],
-    ['server-imports', checkServerImportResolution],
+    ['mcp-tool-surface', checkMcpToolSurface],
     ['bot-heartbeats', checkBotHeartbeats],
+    ['document-build-loop', checkDocumentBuildLoop],
   ]) {
     try {
       const detail = await check()
@@ -1250,7 +1455,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
+    'Coverage: disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; declared bot heartbeat outcomes; disposable document source push/build/render stamp.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)
