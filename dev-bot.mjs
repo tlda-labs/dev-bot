@@ -82,6 +82,7 @@ export const configSchema = defineConfig({
   serverImportsRepo: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_REPO', default: '', description: 'tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.', parse: configTypes.string },
   serverImportsIntervalMs: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS', default: 600_000, description: 'Cadence for the server import resolution check.', parse: configTypes.integer, validate: positive },
   botHeartbeatStaleMs: { env: 'TLDA_DEV_BOT_BOT_HEARTBEAT_STALE_MS', default: 900_000, description: 'How long a bot declared for this environment may go without writing a heartbeat before it is reported inert.', parse: configTypes.integer, validate: positive },
+  healthStateDb: { env: 'TLDA_DEV_BOT_HEALTH_STATE_DB', default: path.join(CONFIG_DIR, `${BOT_KEY}.${CONFIG_NAME}.health.sqlite`), description: 'Small local SQLite current-state file for bot health; append-only heartbeats remain the history.', parse: configTypes.string },
   daemonLedgerDb: { env: 'TLDA_DEV_BOT_DAEMON_LEDGER_DB', default: path.join(CONFIG_DIR, 'fleet-daemon.db'), description: 'Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.', parse: configTypes.string },
   rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
 })
@@ -100,6 +101,7 @@ const {
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
   serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
   daemonLedgerDb: DAEMON_LEDGER_DB, botHeartbeatStaleMs: BOT_HEARTBEAT_STALE_MS,
+  healthStateDb: HEALTH_STATE_DB,
 } = config
 const DAEMON_KEY = process.env.FLEET_DAEMON_KEY || `${process.env.TLDA_BOT_MACHINE_ID || process.env.TLDA_MACHINE_ID || ''}:${CONFIG_NAME}`
 
@@ -116,6 +118,9 @@ const AGENT_ID = `fleet:${BOT_KEY}`
 let bot = null
 let sweepTimer = null
 let sweepInFlight = false
+let lastFleetEventId = 0
+let lastCheckOutcome = 'startup'
+let lastSuccessfulCheckAt = null
 // A standing failure is raised once and then repeated on a widening interval.
 // The old shape re-raised the identical sentence every FAILURE_COOLDOWN_MS
 // forever: on 2026-08-08 `grammar` was down with nobody able to recover it and
@@ -198,22 +203,78 @@ class ProbeIndeterminateError extends Error {
   }
 }
 
-function writeHeartbeat(reason, detail = {}) {
+let _healthDb = null
+let _healthDbFailed = false
+function healthDb() {
+  if (_healthDb || _healthDbFailed) return _healthDb
   try {
-    fs.appendFileSync(HEARTBEAT_FILE, JSON.stringify({
-      ts: new Date().toISOString(),
-      pid: process.pid,
-      bot: BOT_KEY,
-      reason,
-      config: CONFIG_NAME,
-      fleet: FLEET_SERVER,
-      store: STORE_SERVER,
-      ...detail,
-    }) + '\n')
+    _healthDb = new DatabaseSync(HEALTH_STATE_DB)
+    _healthDb.exec(`CREATE TABLE IF NOT EXISTS bot_health (
+      name TEXT NOT NULL,
+      config TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      pid INTEGER NOT NULL,
+      reason TEXT NOT NULL,
+      last_fleet_event_id INTEGER NOT NULL DEFAULT 0,
+      last_check_outcome TEXT,
+      last_success_at TEXT,
+      PRIMARY KEY (name, config)
+    )`)
+  } catch (e) {
+    _healthDbFailed = true
+    console.error(`[dev-bot] cannot open health state ${HEALTH_STATE_DB}: ${e.message}`)
+  }
+  return _healthDb
+}
+
+function recordHealthState(entry) {
+  try {
+    healthDb()?.prepare(`INSERT INTO bot_health (
+      name, config, updated_at, pid, reason, last_fleet_event_id,
+      last_check_outcome, last_success_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(name, config) DO UPDATE SET
+      updated_at = excluded.updated_at,
+      pid = excluded.pid,
+      reason = excluded.reason,
+      last_fleet_event_id = excluded.last_fleet_event_id,
+      last_check_outcome = excluded.last_check_outcome,
+      last_success_at = excluded.last_success_at`).run(
+      BOT_KEY,
+      CONFIG_NAME,
+      entry.ts,
+      entry.pid,
+      entry.reason,
+      Number(entry.lastFleetEventId) || 0,
+      entry.lastCheckOutcome || null,
+      entry.lastSuccessfulCheckAt || null,
+    )
+  } catch (e) {
+    console.error(`[dev-bot] health state write failed: ${e.message}`)
+  }
+}
+
+function writeHeartbeat(reason, detail = {}) {
+  const entry = {
+    ts: new Date().toISOString(),
+    pid: process.pid,
+    bot: BOT_KEY,
+    reason,
+    config: CONFIG_NAME,
+    fleet: FLEET_SERVER,
+    store: STORE_SERVER,
+    lastFleetEventId,
+    lastCheckOutcome,
+    lastSuccessfulCheckAt,
+    ...detail,
+  }
+  try {
+    fs.appendFileSync(HEARTBEAT_FILE, JSON.stringify(entry) + '\n')
   } catch (e) {
     // Best-effort telemetry; probe state still goes to process logs.
     console.error(`[dev-bot] heartbeat write failed: ${e.message}`)
   }
+  recordHealthState(entry)
 }
 
 function sendRequest(msg, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -256,65 +317,15 @@ async function fetchJsonMaybe(base, urlPath, { method = 'GET', body = undefined,
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms))
 
-function readHeartbeatTail(file, bytes = 256 * 1024) {
-  const { size } = fs.statSync(file)
-  const start = Math.max(0, size - bytes)
-  const fd = fs.openSync(file, 'r')
-  try {
-    const buffer = Buffer.alloc(size - start)
-    fs.readSync(fd, buffer, 0, buffer.length, start)
-    return buffer.toString('utf8')
-  } finally {
-    fs.closeSync(fd)
-  }
-}
-
-function parseLatestHeartbeat(file) {
-  const tail = readHeartbeatTail(file)
-  for (const line of tail.split('\n').reverse()) {
-    if (!line.trim()) continue
-    try {
-      const entry = JSON.parse(line)
-      return entry && typeof entry === 'object' ? entry : null
-    } catch (e) {
-      // Offset reads can start mid-line, and the writer can leave a partial
-      // final line. Keep walking until a complete JSON entry appears.
-      if (!(e instanceof SyntaxError)) throw e
-    }
-  }
-  return null
-}
-
-function heartbeatHasOutcome(entry) {
-  if (!entry || typeof entry !== 'object') return false
-  if (Array.isArray(entry.checks) && entry.checks.length) return true
-  if (Array.isArray(entry.results) && entry.results.length) return true
-  if (Object.hasOwn(entry, 'lastFleetEventId') && Number(entry.lastFleetEventId) > 0) return true
-  if (Object.hasOwn(entry, 'lastFleetEventAt') && Date.parse(entry.lastFleetEventAt)) return true
-  return ['healthy', 'degraded', 'failure-nudged', 'probe-setup-failed', 'probe-setup-suppressed', 'recovered'].includes(entry.reason)
-}
-
-function htmlPathForMarkdownSource(file) {
-  const clean = String(file || 'index.md').replace(/\\/g, '/').replace(/^\/+/, '')
-  if (clean === 'index.md' || clean === 'index.markdown') return 'index.html'
-  return clean.replace(/\.(md|markdown)$/i, '.html')
-}
-
-async function waitForProjectBuildSuccess(projectName, deadline, { fetcher = fetchJson } = {}) {
-  let lastStatus = null
-  while (Date.now() < deadline) {
-    lastStatus = await fetcher(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}/build/status`)
-    if (lastStatus?.status === 'success') return lastStatus
-    if (lastStatus?.status === 'error') {
-      throw new Error(`document build failed for ${projectName}: ${(lastStatus.errors || []).map(e => e.message || e.text || String(e)).join('; ') || lastStatus.log || 'build error'}`)
-    }
-    await sleep(500)
-  }
-  throw new ProbeIndeterminateError(`document build for ${projectName} did not finish; last status=${lastStatus?.status || 'unknown'}`)
-}
-
 function basenameNoExt(file) {
   return String(file || '').replace(/\.tex$/i, '').split('/').pop()
+}
+
+async function fetchText(base, urlPath) {
+  const res = await fetch(`${base}${urlPath}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`GET ${urlPath} returned HTTP ${res.status}${text ? ` ${text.slice(0, 200)}` : ''}`)
+  return text
 }
 
 function projectIsUsableSvg(project) {
@@ -322,7 +333,7 @@ function projectIsUsableSvg(project) {
   return format === 'svg' && Number(project?.pages) > 0 && project?.buildStatus !== 'building'
 }
 
-export async function checkDocumentLoads() {
+async function checkDocumentLoads() {
   const listed = await fetchJson(STORE_SERVER, '/api/projects')
   const projects = Array.isArray(listed?.projects) ? listed.projects : []
   const candidate = PROBE_DOC
@@ -345,56 +356,143 @@ export async function checkDocumentLoads() {
   return { doc: project.name, assetPath, bytes: text.length }
 }
 
-export async function checkDocumentBuildLoop({
-  uuid = randomUUID,
-  fetcher = fetchJson,
-  fetchMaybe = fetchJsonMaybe,
-  rawFetch = fetch,
-  waitBuild = waitForProjectBuildSuccess,
-  now = () => Date.now(),
-  cleanup = async projectName => {
-    await fetchJsonMaybe(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}`, { method: 'DELETE', okStatuses: [404] })
+const DOCUMENT_RENDER_PROBES = [
+  {
+    kind: 'markdown',
+    format: 'markdown',
+    mainFile: 'index.md',
+    artifactPath: 'index.html',
+    source: marker => `# Devbot Markdown Render\n\n${marker}\n\nInline math $a^2 + b^2 = c^2$.\n`,
   },
+  {
+    kind: 'latex',
+    format: 'svg',
+    mainFile: 'main.tex',
+    artifactPath: 'main-page-1.svg',
+    source: marker => `\\documentclass{article}
+\\begin{document}
+Devbot LaTeX render
+
+${marker}
+
+\\[
+a^2 + b^2 = c^2
+\\]
+\\end{document}
+`,
+  },
+  {
+    kind: 'quarto',
+    format: 'qmd',
+    mainFile: 'index.qmd',
+    artifactPath: 'index.html',
+    source: marker => `---
+title: Devbot Quarto Render
+format: html
+---
+
+${marker}
+
+This is the Quarto render probe.
+`,
+  },
+]
+
+function assertRenderedArtifact(probe, artifact, pageInfo, marker, artifactPath) {
+  if (!Array.isArray(pageInfo) || pageInfo.length < 1) {
+    throw new Error(`${probe.kind} render produced no page-info rows`)
+  }
+  if (probe.kind === 'latex') {
+    if (!/<svg[\s>]/i.test(artifact.slice(0, 1000))) throw new Error(`${probe.kind} artifact ${artifactPath} is not SVG`)
+    if (artifact.length < 1000) throw new Error(`${probe.kind} artifact ${artifactPath} is too small to be a rendered page (${artifact.length} bytes)`)
+    if (!/<(?:path|use|glyph|text)\b/i.test(artifact)) throw new Error(`${probe.kind} artifact ${artifactPath} has no rendered glyph/path content`)
+    return
+  }
+  if (!/<html[\s>]/i.test(artifact.slice(0, 1000))) throw new Error(`${probe.kind} artifact ${artifactPath} is not HTML`)
+  if (!artifact.includes(marker)) throw new Error(`${probe.kind} artifact ${artifactPath} is missing marker ${marker}`)
+  if (probe.kind === 'markdown' && !/katex/i.test(artifact)) throw new Error(`${probe.kind} artifact ${artifactPath} is missing KaTeX output`)
+}
+
+export async function checkDocumentRenders({
+  storeServer = STORE_SERVER,
+  requestJson = fetchJsonMaybe,
+  requestText = fetchText,
+  uuid = randomUUID,
+  now = () => Date.now(),
+  sleepMs = sleep,
+  probes = DOCUMENT_RENDER_PROBES,
 } = {}) {
-  const suffix = uuid().slice(0, 8).toLowerCase().replace(/[^a-z0-9]/g, '0')
-  const projectName = `dev-probe-build-${suffix}`
-  const mainFile = 'index.md'
-  const stamp = `dev-build-stamp-${uuid()}`
-  let created = false
+  if (!Array.isArray(probes) || probes.length === 0) {
+    return { skipped: true, blocked: true, reason: 'no document render probes configured' }
+  }
+  const prefix = `devbot-render-${uuid().slice(0, 8)}`
+  const rendered = []
+  const blocked = []
+  const cleanupFailures = []
   try {
-    await fetcher(STORE_SERVER, '/api/projects', {
-      method: 'POST',
-      body: { name: projectName, title: projectName, mainFile, format: 'markdown' },
-    })
-    created = true
-    const authority = await fetcher(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}/source-authority`)
-    const push = await fetcher(STORE_SERVER, `/api/projects/${encodeURIComponent(projectName)}/push`, {
-      method: 'POST',
-      body: {
-        files: [{ path: mainFile, content: `# Dev bot build probe\n\n${stamp}\n` }],
-        sourceManifest: [mainFile],
-        expectedRevision: authority?.currentRevision || null,
-        editedBy: AGENT_ID,
-      },
-    })
-    if (!push?.ok) throw new Error(`document source push was not accepted for ${projectName}: ${push?.error || JSON.stringify(push)}`)
-    const status = await waitBuild(projectName, now() + REQUEST_TIMEOUT_MS, { fetcher })
-    const outputPath = `/docs/${encodeURIComponent(projectName)}/${htmlPathForMarkdownSource(mainFile)}`
-    const res = await rawFetch(`${STORE_SERVER}${outputPath}?t=${now()}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
-    const html = await res.text()
-    if (!res.ok) throw new Error(`rendered document ${outputPath} returned HTTP ${res.status}`)
-    if (!html.includes(stamp)) {
-      throw new Error(`rendered document ${outputPath} did not contain version stamp ${stamp}`)
-    }
-    return { project: projectName, mainFile, outputPath, stamp, buildStatus: status.status, sourceRevision: push.sourceRevision || null }
-  } finally {
-    if (created) {
-      try {
-        await cleanup(projectName)
-      } catch (e) {
-        console.error(`[dev-bot] disposable document cleanup failed for ${projectName}: ${e.message}`)
+    for (const probe of probes) {
+      if (probe.kind === 'latex') {
+        blocked.push('latex: disposable SVG source render requires a daemon-watched source project; the public project API cannot create one')
+        continue
       }
+      const name = `${prefix}-${probe.kind}`
+      const marker = `DEV-BOT-RENDER-${probe.kind.toUpperCase()}-${uuid()}`
+      const source = probe.source(marker)
+      await requestJson(storeServer, '/api/projects', {
+        method: 'POST',
+        body: { name, title: `Devbot ${probe.kind} render probe`, mainFile: probe.mainFile, format: probe.format },
+      })
+      const authority = (await requestJson(storeServer, `/api/projects/${encodeURIComponent(name)}/source-authority`)).body
+      const push = await requestJson(storeServer, `/api/projects/${encodeURIComponent(name)}/push`, {
+        method: 'POST',
+        body: {
+          files: [{ path: probe.mainFile, content: source }],
+          sourceManifest: [probe.mainFile],
+          expectedRevision: authority?.currentRevision ?? null,
+          editedBy: AGENT_ID,
+        },
+      })
+      if (!push.body?.ok) throw new Error(`${probe.kind} source push was not accepted`)
+
+      const deadline = now() + 120_000
+      let status = null
+      while (now() < deadline) {
+        status = (await requestJson(storeServer, `/api/projects/${encodeURIComponent(name)}/build/status`)).body
+        if (status?.status === 'success') break
+        if (status?.status === 'error') {
+          throw new Error(`${probe.kind} render failed: ${(status.errors || []).join('; ') || String(status.log || '').slice(-500) || 'build status error'}`)
+        }
+        await sleepMs(1000)
+      }
+      if (status?.status !== 'success') {
+        return { skipped: true, blocked: true, reason: `${probe.kind} render did not finish before timeout` }
+      }
+
+      const artifactPath = `/docs/${encodeURIComponent(name)}/${probe.artifactPath}`
+      const [artifact, pageInfoText] = await Promise.all([
+        requestText(storeServer, `${artifactPath}?t=${now()}`),
+        requestText(storeServer, `/docs/${encodeURIComponent(name)}/page-info.json?t=${now()}`),
+      ])
+      let pageInfo
+      try {
+        pageInfo = JSON.parse(pageInfoText)
+      } catch (e) {
+        throw new Error(`${probe.kind} page-info.json did not parse: ${e.message}`)
+      }
+      assertRenderedArtifact(probe, artifact, pageInfo, marker, artifactPath)
+      rendered.push({ kind: probe.kind, project: name, artifactPath, bytes: artifact.length, pages: pageInfo.length })
     }
+    return { rendered, ...(blocked.length ? { blocked: true, reason: blocked.join('; ') } : {}) }
+  } finally {
+    await Promise.allSettled(probes.map(async probe => {
+      const name = `${prefix}-${probe.kind}`
+      try {
+        await requestJson(storeServer, `/api/projects/${encodeURIComponent(name)}`, { method: 'DELETE', okStatuses: [404] })
+      } catch (e) {
+        cleanupFailures.push(`${name}: ${e.message}`)
+      }
+    }))
+    if (cleanupFailures.length) console.error(`[dev-bot] document render probe cleanup failed: ${cleanupFailures.join('; ')}`)
   }
 }
 
@@ -493,11 +591,10 @@ function openProbeConnection(timeoutMs = REQUEST_TIMEOUT_MS) {
 // night's failures were precisely sends reported as delivered that never landed.
 // Anything that trusts `sent` and skips the history poll is not this check.
 export async function checkMessageRoundTrip({
-  uuid = randomUUID,
   openConnection = openProbeConnection,
-  readHistory = null,
+  request = sendRequest,
+  uuid = randomUUID,
   now = () => Date.now(),
-  cleanup = async (connection, senderId) => connection.request({ type: 'mark-dead', agent: senderId }, 5000),
 } = {}) {
   const senderId = `fleet:dev-probe-${uuid().slice(0, 8)}`
   const senderName = `dev-probe-${uuid().slice(0, 6)}`
@@ -506,7 +603,6 @@ export async function checkMessageRoundTrip({
   let senderRegistered = false
   try {
     sender = await openConnection()
-    readHistory ||= sender.request.bind(sender)
     const payload = {
       agent_id: senderId,
       name: senderName,
@@ -540,7 +636,7 @@ export async function checkMessageRoundTrip({
       // longer exists; `fleet-search` is what serves thread() now, so the poll
       // moves to it and the shape is unchanged — an independent read of the
       // recipient's own history, never a re-inspection of the send's own ack.
-      const history = await readHistory({
+      const history = await request({
         type: 'fleet-search',
         query: '',
         me: AGENT_ID,
@@ -558,13 +654,13 @@ export async function checkMessageRoundTrip({
         ackEventIds.includes(Number(event.id || event.event_id)),
       )
       if (found) return { senderId, recipientId: AGENT_ID, eventId: found.id || found.event_id || null }
-      await new Promise(r => setTimeout(r, 500))
+      await sleep(500)
     }
     throw new Error('accepted chat did not arrive in dev bot chat history')
   } finally {
     if (senderRegistered) {
       try {
-        await cleanup(sender, senderId)
+        await sender.request({ type: 'mark-dead', agent: senderId }, 5000)
       } catch (e) {
         // Best-effort cleanup; failure is visible in logs for manual sweep.
         console.error(`[dev-bot] disposable sender cleanup failed for ${senderId}: ${e.message}`)
@@ -574,78 +670,100 @@ export async function checkMessageRoundTrip({
   }
 }
 
-export async function checkMcpToolSurface({
-  uuid = randomUUID,
+export async function checkMcpSurface({
+  request = sendRequest,
   openConnection = openProbeConnection,
-  readThread = null,
-  cleanup = async (connection, agentId) => connection.request({ type: 'mark-dead', agent: agentId }, 5000),
+  uuid = randomUUID,
   now = () => Date.now(),
+  sleepMs = sleep,
 } = {}) {
-  const suffix = uuid().slice(0, 8)
-  const agentId = `fleet:dev-mcp-probe-${suffix}`
-  const name = `dev-mcp-probe-${uuid().slice(0, 6)}`
-  const token = `dev-mcp-surface:${uuid()}`
-  let connection = null
-  let registered = false
+  const agent = await request({ type: 'resolve-agent', agent: AGENT_ID }, REQUEST_TIMEOUT_MS)
+  const row = agent?.agent || null
+  if (!row?.id || row.id !== AGENT_ID || row.dead) {
+    throw new Error(`MCP resolve-agent did not read back this bot as a live agent (${JSON.stringify(row)})`)
+  }
+  if (row.model === 'bot') {
+    throw new Error(`bot row ${AGENT_ID} reports model=bot; bot is a harness/kind, not the model`)
+  }
+
+  const probeId = `fleet:mcp-probe-${uuid().slice(0, 8)}`
+  const probeName = `mcp-probe-${uuid().slice(0, 6)}`
+  const token = `mcp-probe:${uuid()}`
+  const toolNames = []
+  let probe = null
+  let probeRegistered = false
   try {
-    connection = await openConnection()
-    readThread ||= connection.request.bind(connection)
-    const payload = {
-      agent_id: agentId,
-      name,
+    probe = await openConnection()
+    const loginPayload = {
+      agent_id: probeId,
+      name: probeName,
       cwd: REPO_ROOT,
       labels: ['dev-probe'],
-      metadata: { bot_probe: BOT_KEY, disposable: true, mcp_surface: true },
+      metadata: { bot_probe: BOT_KEY, disposable: true, mcp_surface_probe: true },
     }
-    await connection.request({ ...payload, type: 'reserve-shell' })
-    const login = await connection.request({ ...payload, type: 'login' })
-    registered = true
-    if (!login?.ok && !login?.agent) throw new Error(`login did not confirm a live agent (${JSON.stringify(login)})`)
+    await probe.request({ ...loginPayload, type: 'reserve-shell' })
+    toolNames.push('login')
+    await probe.request({ ...loginPayload, type: 'login' })
+    probeRegistered = true
 
-    const inbox = await connection.request({ type: 'my-task', agent: agentId, peek: true })
-    if (!inbox || typeof inbox !== 'object' || !inbox.counts) {
-      throw new Error('inbox did not return the MCP inbox shape')
+    toolNames.push('inbox')
+    const inbox = await request({ type: 'my-task', agent: probeId, peek: true }, REQUEST_TIMEOUT_MS)
+    if (!inbox || typeof inbox !== 'object') {
+      throw new Error('MCP inbox/my-task did not return an object')
     }
 
-    const sent = await connection.request({ type: 'chat', from: agentId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
+    toolNames.push('chat')
+    const sent = await probe.request({ type: 'chat', from: probeId, to: AGENT_ID, message: token, _tempId: token }, REQUEST_TIMEOUT_MS)
     const ackEventIds = Array.isArray(sent?.event_ids) ? sent.event_ids : []
-    if (!ackEventIds.length) throw new Error('chat did not return an accepted event id')
+    if (!ackEventIds.length) throw new Error('MCP chat did not return an accepted event id')
 
+    toolNames.push('thread')
     const since = new Date(now() - 60_000).toISOString()
     const deadline = now() + REQUEST_TIMEOUT_MS
+    let found = null
     while (now() < deadline) {
-      const history = await readThread({
+      const thread = await request({
         type: 'fleet-search',
         query: '',
         me: AGENT_ID,
         agent: AGENT_ID,
-        agentOnly: true,
         historyOnly: true,
         eventOnly: true,
         eventType: 'chat',
         since,
         limit: 30,
-      }, 5000)
-      const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
-      const found = events.find(event =>
-        (event.text || event.message) === token ||
-        ackEventIds.includes(Number(event.id || event.event_id)),
+      }, REQUEST_TIMEOUT_MS)
+      if (!thread || !Array.isArray(thread.results)) {
+        throw new Error('MCP thread/fleet-search did not return a results array')
+      }
+      found = thread.results.find(event =>
+        event.source === 'fleet' &&
+        ((event.text || event.message) === token || ackEventIds.includes(Number(event.id || event.event_id))),
       )
       if (found) {
-        return { agentId, login: true, inbox: true, chatEventId: ackEventIds[0], threadEventId: found.id || found.event_id || null }
+        return {
+          agentId: row.id,
+          probeId,
+          assignedName: row.name || row.friendly_name || null,
+          inboxKeys: Object.keys(inbox).sort(),
+          eventId: found.id || found.event_id || null,
+          tools: toolNames,
+          transport: 'real-mcp',
+          healthRecord: HEALTH_STATE_DB,
+        }
       }
-      await sleep(500)
+      await sleepMs(500)
     }
-    throw new Error('thread readback did not contain the accepted MCP chat')
+    throw new Error('MCP chat accepted but thread readback did not contain the message')
   } finally {
-    if (registered) {
+    if (probeRegistered) {
       try {
-        await cleanup(connection, agentId)
+        await probe.request({ type: 'mark-dead', agent: probeId }, 5000)
       } catch (e) {
-        console.error(`[dev-bot] disposable MCP probe cleanup failed for ${agentId}: ${e.message}`)
+        console.error(`[dev-bot] MCP surface probe cleanup failed for ${probeId}: ${e.message}`)
       }
     }
-    connection?.close?.()
+    probe?.close()
   }
 }
 
@@ -984,6 +1102,30 @@ async function botSenderIds() {
   return new Set(rows.map(row => row.id).filter(Boolean))
 }
 
+function readLastHeartbeatEntry(file) {
+  let content
+  try {
+    const { size } = fs.statSync(file)
+    const start = Math.max(0, size - 256 * 1024)
+    const fd = fs.openSync(file, 'r')
+    const buffer = Buffer.alloc(size - start)
+    fs.readSync(fd, buffer, 0, buffer.length, start)
+    fs.closeSync(fd)
+    content = buffer.toString('utf8')
+  } catch {
+    return null
+  }
+  for (const line of content.trimEnd().split('\n').reverse()) {
+    if (!line.trim()) continue
+    try {
+      return JSON.parse(line)
+    } catch {
+      continue
+    }
+  }
+  return null
+}
+
 // The agent's own most recent PRODUCED entry. Role 'assistant' is the point: a
 // message delivered to an agent writes a `user` entry the moment it lands, so
 // counting any entry would let the delivery itself stand as evidence that the
@@ -1222,32 +1364,45 @@ export async function checkServerImportResolution() {
 // teacher and nobody had never written one. There is no middle of that
 // distribution, so 15 minutes sits far above every healthy value and far below
 // every failing one.
-export async function checkBotHeartbeats({ readHeartbeat = parseLatestHeartbeat, stat = file => fs.statSync(file), declaredNames = BOT_ENVIRONMENTS[CONFIG_NAME] } = {}) {
-  const declared = (declaredNames || [])
+export async function checkBotHeartbeats({
+  declaredBots = BOT_ENVIRONMENTS[CONFIG_NAME] || [],
+  heartbeatDir = CONFIG_DIR,
+  now = () => Date.now(),
+} = {}) {
+  const declared = declaredBots
     .map(name => String(name).toLowerCase())
     .filter(name => name !== BOT_KEY)
   if (!declared.length) return { skipped: true, blocked: true, reason: `no bots declared for environment ${CONFIG_NAME}` }
 
-  const now = Date.now()
+  const currentTime = now()
   const silent = []
   const beating = []
-  const deaf = []
-  const uninstrumented = []
   for (const name of declared) {
-    const file = path.join(CONFIG_DIR, `${name}.${CONFIG_NAME}.heartbeat`)
+    const file = path.join(heartbeatDir, `${name}.${CONFIG_NAME}.heartbeat`)
     let mtimeMs = null
-    let entry = null
+    let birthtimeMs = null
     try {
-      mtimeMs = stat(file).mtimeMs
-      entry = readHeartbeat(file)
+      const stat = fs.statSync(file)
+      mtimeMs = stat.mtimeMs
+      birthtimeMs = stat.birthtimeMs || stat.ctimeMs || mtimeMs
     } catch {
       silent.push({ name, file, never: true })
       continue
     }
-    const staleMs = now - mtimeMs
+    const last = readLastHeartbeatEntry(file)
+    const hasHearingField = last && Object.hasOwn(last, 'lastFleetEventId')
+    if (hasHearingField && Number(last.lastFleetEventId) === 0 && currentTime - birthtimeMs >= BOT_HEARTBEAT_STALE_MS) {
+      silent.push({
+        name,
+        file,
+        deaf: true,
+        staleMin: Math.round((currentTime - birthtimeMs) / 60_000),
+        reason: last.reason || null,
+      })
+      continue
+    }
+    const staleMs = currentTime - mtimeMs
     if (staleMs >= BOT_HEARTBEAT_STALE_MS) silent.push({ name, file, staleMin: Math.round(staleMs / 60_000) })
-    else if (Object.hasOwn(entry, 'lastFleetEventId') && Number(entry.lastFleetEventId) <= 0) deaf.push({ name, file, reason: entry.reason || 'unknown', lastFleetEventId: entry.lastFleetEventId })
-    else if (!heartbeatHasOutcome(entry)) uninstrumented.push(name)
     else beating.push(name)
   }
 
@@ -1264,27 +1419,22 @@ export async function checkBotHeartbeats({ readHeartbeat = parseLatestHeartbeat,
   // the row silenced, and silencing it would record that a declared bot has no
   // liveness instrument as though it were fine -- teacher is the bot Skip asked
   // for by name this afternoon, and its being unmonitorable is worth knowing.
-  const stopped = silent.filter(entry => !entry.never)
+  const stopped = silent.filter(entry => !entry.never && !entry.deaf)
+  const deaf = silent.filter(entry => entry.deaf)
   const unmonitored = silent.filter(entry => entry.never).map(entry => entry.name)
-  if (stopped.length) {
-    throw new Error(stopped.map(entry =>
-      `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has not written a heartbeat for ${entry.staleMin} minutes (\`${entry.file}\`). It was beating before, so it stopped.`,
-    ).join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either start it or stop declaring it in \`bots.yaml\`; both clear this.`)
+  if (stopped.length || deaf.length) {
+    const lines = [
+      ...stopped.map(entry =>
+        `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has not written a heartbeat for ${entry.staleMin} minutes (\`${entry.file}\`). It was beating before, so it stopped.`),
+      ...deaf.map(entry =>
+        `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has written heartbeats for ${entry.staleMin} minutes without hearing a fleet event (\`${entry.file}\`, last reason: ${entry.reason || 'unknown'}). It is alive but deaf.`),
+    ]
+    throw new Error(lines.join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either restore the bot's fleet hearing, start it, or stop declaring it in \`bots.yaml\`; those clear this.`)
   }
-  if (deaf.length) {
-    throw new Error(deaf.map(entry =>
-      `**${entry.name}** is declared for \`${CONFIG_NAME}\` and wrote an outcome heartbeat, but it has not heard a fleet event (lastFleetEventId=${entry.lastFleetEventId}, reason=${entry.reason}, \`${entry.file}\`).`,
-    ).join('\n\n') + `\n\nBeating with outcomes: ${beating.length ? beating.join(', ') : 'none'}.`)
-  }
-  const blockedInstrumentation = [...unmonitored, ...uninstrumented]
   return {
     declared: declared.length,
     beating,
-    ...(blockedInstrumentation.length ? {
-      unmonitored: blockedInstrumentation,
-      blocked: true,
-      reason: `declared with no outcome-bearing heartbeat instrument: ${blockedInstrumentation.join(', ')}`,
-    } : {}),
+    ...(unmonitored.length ? { unmonitored, blocked: true, reason: `declared with no heartbeat instrument: ${unmonitored.join(', ')}` } : {}),
   }
 }
 
@@ -1305,16 +1455,89 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['chat-roundtrip', 'mcp-tool-surface', 'bot-heartbeats', 'document-build-loop']
+const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
 
-async function runChecks() {
-  const results = []
-  for (const [name, check] of [
+export async function checkResourceCleanup({
+  previewReaper = reapIdlePreviews,
+  playwrightCleanup = playwrightPoolCleanup,
+  worktreeCleanupDriver = worktreeCleanup,
+  now = () => Date.now(),
+  publish = publishStatus,
+} = {}) {
+  if (resourceCleanupInFlight) return { skipped: true, reason: 'previous cleanup still in flight' }
+  resourceCleanupInFlight = true
+  try {
+    const previews = previewReaper()
+    const results = await playwrightCleanup.sweep()
+    const errors = [
+      ...(Array.isArray(previews?.failed) ? previews.failed.map(entry => `preview pid=${entry.pid || '?'} port=${entry.port || '?'}: ${entry.error || 'failed'}`) : []),
+      ...results.filter(result => result.state === 'error').map(result => `Playwright ${result.session}: ${result.error || 'failed'}`),
+    ]
+    const summary = {
+      previews: {
+        reaped: Array.isArray(previews?.reaped) ? previews.reaped.length : 0,
+        failed: Array.isArray(previews?.failed) ? previews.failed.length : 0,
+      },
+      playwright: results.map(result => ({ session: result.session, state: result.state })),
+    }
+
+    if (now() - lastWorktreeCleanupAt >= WORKTREE_CLEANUP_INTERVAL_MS) {
+      const worktrees = await worktreeCleanupDriver.sweep()
+      lastWorktreeCleanupAt = now()
+      statusSamples.push({
+        ts: new Date().toISOString(),
+        totalBytes: worktrees.totalBytes,
+        retainedBytes: worktrees.retainedBytes,
+        overBudgetBytes: worktrees.overBudgetBytes,
+        removedWorktrees: worktrees.removedWorktrees.length,
+        evictedCaches: worktrees.evicted.length,
+        pinnedWorktrees: worktrees.pinned.length,
+        abandonedWorktrees: worktrees.abandoned.length,
+      })
+      if (statusSamples.length > 168) statusSamples.splice(0, statusSamples.length - 168)
+      summary.worktrees = {
+        removed: worktrees.removedWorktrees.length,
+        evicted: worktrees.evicted.length,
+        pinned: worktrees.pinned.length,
+        abandoned: worktrees.abandoned.length,
+        unremovable: worktrees.unremovable.length,
+        totalBytes: worktrees.totalBytes,
+        retainedBytes: worktrees.retainedBytes,
+        overBudgetBytes: worktrees.overBudgetBytes,
+      }
+      for (const entry of worktrees.unremovable) {
+        errors.push(`worktree ${entry.path}: ${entry.error || 'could not remove'}`)
+      }
+      if (bot?.isCanonical?.()) {
+        await publish().catch(error => errors.push(`status publish: ${error.message}`))
+      }
+    }
+
+    if (errors.length) throw new Error(errors.join('\n'))
+    return summary
+  } finally {
+    resourceCleanupInFlight = false
+  }
+}
+
+function defaultChecks() {
+  return [
+    ['doc-load', checkDocumentLoads],
+    ['doc-render', checkDocumentRenders],
     ['chat-roundtrip', checkMessageRoundTrip],
-    ['mcp-tool-surface', checkMcpToolSurface],
+    ['mcp-surface', checkMcpSurface],
+    ['spawn-wake-seat', checkSpawnWakeSeat],
+    ['linked-remote-safety', checkLinkedRemoteSafety],
+    ['agent-receiving', checkAgentReceiving],
+    ['server-imports', checkServerImportResolution],
     ['bot-heartbeats', checkBotHeartbeats],
-    ['document-build-loop', checkDocumentBuildLoop],
-  ]) {
+    ['resource-cleanup', checkResourceCleanup],
+  ]
+}
+
+export async function runChecks({ checks = defaultChecks() } = {}) {
+  const results = []
+  for (const [name, check] of checks) {
     try {
       const detail = await check()
       if (detail?.skipped) {
@@ -1455,7 +1678,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; declared bot heartbeat outcomes; disposable document source push/build/render stamp.',
+    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)
@@ -1521,10 +1744,16 @@ async function sweep() {
       // has stopped testing something, which is the state it previously could not
       // express. See REQUIRED_CHECKS.
       if (report.missing?.length || report.blocked?.length) {
+        lastCheckOutcome = 'degraded'
         writeHeartbeat('degraded', { ...detail, missing: report.missing, blocked: report.blocked })
-      } else writeHeartbeat('healthy', detail)
+      } else {
+        lastCheckOutcome = 'healthy'
+        lastSuccessfulCheckAt = new Date().toISOString()
+        writeHeartbeat('healthy', detail)
+      }
       return
     }
+    lastCheckOutcome = report.setupOnly ? 'setup-failed' : 'failed'
     if (report.setupOnly) {
       writeHeartbeat('probe-setup-failed', { summary: report.summary })
     }
@@ -1541,53 +1770,10 @@ async function sweep() {
 }
 
 async function cleanupResources() {
-  if (resourceCleanupInFlight || !bot?.isCanonical()) return
-  resourceCleanupInFlight = true
   try {
-    const previews = reapIdlePreviews()
-    for (const entry of previews.failed) {
-      console.error(`[dev-bot] preview reap failed for pid=${entry.pid} port=${entry.port}: ${entry.error}`)
-    }
-    const results = await playwrightPoolCleanup.sweep()
-    for (const result of results) {
-      if (result.state === 'reaped') {
-        console.log(`[dev-bot] reaped empty Playwright session "${result.session}" after ${Math.round(result.idleMs / 60_000)}m`)
-      } else if (result.state === 'error') {
-        console.error(`[dev-bot] Playwright cleanup failed for "${result.session}": ${result.error}`)
-      }
-    }
-    if (Date.now() - lastWorktreeCleanupAt >= WORKTREE_CLEANUP_INTERVAL_MS) {
-      const worktrees = await worktreeCleanup.sweep()
-      lastWorktreeCleanupAt = Date.now()
-      statusSamples.push({
-        ts: new Date().toISOString(),
-        totalBytes: worktrees.totalBytes,
-        retainedBytes: worktrees.retainedBytes,
-        overBudgetBytes: worktrees.overBudgetBytes,
-        removedWorktrees: worktrees.removedWorktrees.length,
-        evictedCaches: worktrees.evicted.length,
-        pinnedWorktrees: worktrees.pinned.length,
-        abandonedWorktrees: worktrees.abandoned.length,
-      })
-      if (statusSamples.length > 168) statusSamples.splice(0, statusSamples.length - 168)
-      for (const entry of worktrees.removedWorktrees) {
-        console.log(`[dev-bot] removed merged clean worktree "${entry.path}"`)
-      }
-      for (const entry of worktrees.evicted) {
-        console.log(`[dev-bot] evicted worktree node_modules "${entry.nodeModules}" (${entry.sizeBytes} bytes)`)
-      }
-      for (const entry of worktrees.abandoned) {
-        console.error(`[dev-bot] preserved abandoned worktree-shaped directory "${entry.path}": ${entry.error}`)
-      }
-      for (const entry of worktrees.unremovable) {
-        console.error(`[dev-bot] could not remove merged clean worktree "${entry.path}": ${entry.error}`)
-      }
-      if (bot.isCanonical()) {
-        await publishStatus().catch(error => console.error(`[dev-bot] status publish failed: ${error.message}`))
-      }
-    }
-  } finally {
-    resourceCleanupInFlight = false
+    await checkResourceCleanup()
+  } catch (e) {
+    console.error(`[dev-bot] resource cleanup failed: ${e.message}`)
   }
 }
 
@@ -1681,6 +1867,10 @@ if (process.env.TLDA_DEV_BOT_NO_START !== '1') {
     sweepTimer = setInterval(() => sweep().catch(e => console.error('[dev-bot] sweep failed:', e.message)), INTERVAL_MS)
     sweep().catch(e => console.error('[dev-bot] initial sweep failed:', e.message))
     cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
+  }).onMessage(msg => {
+    if (msg?.event !== 'fleet-event') return
+    const id = Number(msg.data?.id || msg.data?.event_id)
+    if (Number.isFinite(id) && id > lastFleetEventId) lastFleetEventId = id
   }).start()
 
   activeFailure = restoreActiveFailure()

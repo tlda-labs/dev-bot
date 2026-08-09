@@ -3,10 +3,10 @@
 The dev bot monitors the configured testing environment with real stage-one
 feature checks: disposable fleet chat delivery confirmed by history readback,
 the real MCP login/inbox/chat/thread surface, declared bot heartbeat outcomes,
-and a disposable Markdown source push/build/render stamp. Healthy checks stay
-quiet. Failures notify eligible on-call agents. The bot also owns cleanup of
-idle Playwright sessions, merged clean worktrees, and over-budget worktree
-dependency caches.
+document load plus Markdown/Quarto render artifact readback, and cleanup
+accounting. Healthy checks stay quiet. Failures notify eligible on-call agents.
+The bot also owns cleanup of idle Playwright sessions, merged clean worktrees,
+and over-budget worktree dependency caches.
 
 Its authority is limited to its configured non-stable environment, disposable
 probe agents and tasks, configured failure-notice recipients, local cleanup
@@ -75,6 +75,7 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_SERVER_IMPORTS_REPO` (serverImportsRepo; default: `""`) — tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.
 - `TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS` (serverImportsIntervalMs; default: `600000`) — Cadence for the server import resolution check.
 - `TLDA_DEV_BOT_BOT_HEARTBEAT_STALE_MS` (botHeartbeatStaleMs; default: `900000`) — How long a bot declared for this environment may go without writing a heartbeat before it is reported inert.
+- `TLDA_DEV_BOT_HEALTH_STATE_DB` (healthStateDb; default: `"/Users/skip/.config/tlda/dev.testing.health.sqlite"`) — Small local SQLite current-state file for bot health; append-only heartbeats remain the history.
 - `TLDA_DEV_BOT_DAEMON_LEDGER_DB` (daemonLedgerDb; default: `"/Users/skip/.config/tlda/fleet-daemon.db"`) — Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.
 - `TLDA_DEV_BOT_ROSTER_TIMEOUT_MS` (rosterTimeoutMs; default: `90000`) — Timeout for a whole-roster read, which is far slower than an ordinary fleet request.
 <!-- END GENERATED CONFIG -->
@@ -117,9 +118,9 @@ Local verification:
 ```sh
 npm test
 node --check dev-bot.mjs
-npm run docs:check
+npm run test:red
+TLDA_DEV_BOT_NO_START=1 node generate-docs.mjs --check
 ```
 
-The remaining live proof is supervisor-owned login and heartbeat, one
-non-continuous stage-one sweep, `help`, one `status` command, and the
-browser-visible rendered status document.
+The remaining live proof is supervisor-owned login and heartbeat, `help`, one
+`status` command, and the browser-visible rendered status document.
