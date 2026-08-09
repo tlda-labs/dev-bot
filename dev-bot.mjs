@@ -11,6 +11,7 @@ import fs from 'fs'
 import path from 'path'
 import { randomUUID } from 'crypto'
 import { DatabaseSync } from 'node:sqlite'
+import { execFileSync } from 'child_process'
 import { fileURLToPath } from 'url'
 
 import {
@@ -702,6 +703,30 @@ function daemonCanPlace(agentId) {
   }
 }
 
+// Whether ANY daemon claims this agent. Distinct from daemonCanPlace, which asks
+// about this one: an agent belonging to another machine legitimately has a row
+// under a different key, and must not be called stale for it.
+function daemonKnowsAnywhere(agentId) {
+  if (!DAEMON_LEDGER_DB) return null
+  try {
+    return !!daemonLedger()?.prepare('SELECT 1 FROM permission_grants WHERE id = ? LIMIT 1').get(agentId)
+  } catch {
+    return null
+  }
+}
+
+function hasLocalSession(name) {
+  if (!name) return null
+  try {
+    execFileSync('tmux', ['has-session', '-t', `fleet-${name}`], { stdio: 'ignore', timeout: 5000 })
+    return true
+  } catch (e) {
+    // Exit 1 is "no such session", which is the answer. Anything else -- tmux
+    // missing, server unreachable -- is not measured, and must not read as absent.
+    return e?.status === 1 ? false : null
+  }
+}
+
 let _daemonLedger = null
 let _daemonLedgerFailed = false
 function daemonLedger() {
@@ -889,6 +914,8 @@ async function runAgentReceiving() {
       activity: row.activity || null,
       tool: row.tool || null,
       placeable: daemonCanPlace(row.id),
+      knownAnywhere: daemonKnowsAnywhere(row.id),
+      localSession: hasLocalSession(row.name || null),
     })
   }
 
@@ -904,8 +931,19 @@ async function runAgentReceiving() {
       `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
       `- daemon last saw the process ${entry.lastSeenAgoS}s ago`,
       entry.placeable === false
-        ? '- **no `permission_grants` row for this daemon — it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.** Recovery is `tmux kill-session` plus an operator wake.'
+        ? '- **no `permission_grants` row for this daemon — it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.**'
         : entry.placeable === null ? '- daemon placement: not measured (ledger unreadable)' : null,
+      // A stale row and a silent agent need different actions, and until now the
+      // notice said the same thing about both. When no daemon anywhere claims the
+      // agent AND no tmux session exists on this machine, nothing is running it,
+      // so `awake` is the row being wrong rather than the agent being quiet. The
+      // one path that could correct it -- `hibernate` -- short-circuits on
+      // "already hibernating" without emitting a transition, so the row stays
+      // wrong forever and this alarm cannot clear on its own. Both conditions are
+      // required: an agent on another machine legitimately has a row elsewhere.
+      entry.knownAnywhere === false && entry.localSession === false
+        ? '- **the roster says `awake`, and nothing is running it** — no tmux session on this machine, no daemon ledger row anywhere. This is a stuck row, not a silent agent, and `hibernate` short-circuits without correcting it.'
+        : null,
     ].filter(Boolean).join('\n')).join('\n\n')
     const preface = hasActivityAt
       ? ''
