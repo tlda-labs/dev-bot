@@ -950,7 +950,12 @@ async function runAgentReceiving() {
       : '_Degraded: this server does not send `activity_at`, so every awake agent was queried instead of only the silent ones._\n\n'
     throw new Error(`${preface}${lines}`)
   }
-  return { watched: rows.length, queried: candidates.length, windowMin: Math.round(AGENT_SILENCE_WINDOW_MS / 60_000) }
+  return {
+    watched: rows.length,
+    queried: candidates.length,
+    windowMin: Math.round(AGENT_SILENCE_WINDOW_MS / 60_000),
+    watchedIds: rows.map(row => row.id),
+  }
 }
 
 // The only check here that is not about a running system. It is a static read of
@@ -1269,10 +1274,37 @@ async function sweep() {
       if (activeFailure) {
         const cleared = activeFailure
         activeFailure = null
-        writeHeartbeat('recovered', { summary: cleared.summary, standingForMin: Math.round((Date.now() - cleared.firstAt) / 60_000) })
+        const standingForMin = Math.round((Date.now() - cleared.firstAt) / 60_000)
+        // "The condition no longer holds" is not "the subject is fine". An agent
+        // that leaves `filter=awake` stops being watched, and reading that as
+        // recovery is worse than never firing: a `cleared` line actively tells
+        // the reader to stop looking. On 2026-08-08 this bot announced
+        // `really-able-to-do-stuff` cleared after 16 minutes when nothing about
+        // it had changed except its roster row flipping to `hibernating` -- the
+        // wake still failed on an unknown permission profile.
+        //
+        // So the subjects named in the standing failure are checked against the
+        // population actually watched this sweep. Any that are missing left the
+        // filter, and that clears as "no longer observable" with their names.
+        const watchedNow = new Set(report.results.flatMap(r => r.detail?.watchedIds || []))
+        const subjects = [...new Set(cleared.summary.match(/fleet:[0-9a-z-]+/g) || [])]
+        const unobserved = subjects.filter(id => !watchedNow.has(id))
+        const observable = subjects.length > 0 && unobserved.length === 0
+        writeHeartbeat('recovered', {
+          summary: cleared.summary,
+          standingForMin,
+          ...(unobserved.length ? { unobserved } : {}),
+        })
         const { targets } = await nudgeTargets()
+        const headline = unobserved.length
+          ? [
+            `**dev noticer: no longer observable** after ${standingForMin} minutes — this is NOT a recovery.`,
+            '',
+            `${unobserved.join(', ')} left the watched population, so this check can no longer see ${unobserved.length > 1 ? 'them' : 'it'}. Nothing here says ${unobserved.length > 1 ? 'they are' : 'it is'} fixed.`,
+          ].join('\n')
+          : `**dev noticer: cleared** after ${standingForMin} minutes.${observable ? '' : ''}`
         for (const target of targets) {
-          await sendChat(target, `**dev noticer: cleared** after ${Math.round((Date.now() - cleared.firstAt) / 60_000)} minutes.\n\n${cleared.summary.split('\n')[0]}`)
+          await sendChat(target, `${headline}\n\n${cleared.summary.split('\n')[0]}`)
         }
       }
       const detail = {
