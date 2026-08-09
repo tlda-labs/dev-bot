@@ -167,7 +167,7 @@ function restoreActiveFailure() {
     const at = Date.parse(entry.ts)
     if (!Number.isFinite(at)) return null
     return {
-      key: entry.summary,
+      key: failureKey(entry.summary),
       summary: entry.summary,
       firstAt: at - (Number(entry.standingForMin) || 0) * 60_000,
       lastNudgeAt: at,
@@ -1157,12 +1157,27 @@ async function sendChat(to, message) {
   })
 }
 
+export function failureKey(summary) {
+  return String(summary || '').replace(/\d+/g, '#')
+}
+
 async function sendFailureNudge(report) {
   if (report.setupOnly && !NUDGE_ON_SETUP) {
     writeHeartbeat('probe-setup-suppressed', { summary: report.summary })
     return
   }
-  const key = report.summary
+  // The key must be STABLE while the finding is unchanged, and the summary is
+  // not: `agent-receiving` says "has produced nothing for N minutes" and N grows
+  // every sweep, so every repeat looked like a brand-new finding and raised
+  // immediately. The backoff shipped tonight therefore never engaged once --
+  // all eleven agent-receiving nudges recorded `repeats: 0`, including three
+  // after the backoff landed, while app-chief2 was being told the same thing
+  // about the same two agents for hours.
+  //
+  // Digits are collapsed so an elapsed-time counter cannot masquerade as news. A
+  // genuinely new finding still changes the words -- a different agent, a
+  // different check, a different reason -- and still interrupts immediately.
+  const key = failureKey(report.summary)
   const now = Date.now()
   const unchanged = activeFailure?.key === key
   if (unchanged) {
