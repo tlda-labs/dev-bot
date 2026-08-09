@@ -731,12 +731,34 @@ function rowIsWatchable(row) {
 // its own timeout -- an alarm crying during normal operation, which is the one
 // outcome worse than no alarm. It is also why these checks run on their own
 // cadence rather than once a minute.
+// A roster read that fails is this check being unable to run, NOT a finding about
+// any agent -- so it raises ProbeSetupError, which the notifier suppresses by
+// default. On 2026-08-08 a deploy window returned HTTP 502 here and on-call was
+// nudged with `fleet-table (awake) returned HTTP 502`, which is an alarm crying
+// during normal operation: deploys are normal, and this bot is restarted through
+// them all evening.
+//
+// Nothing is lost by not shouting. A server that is genuinely down fails
+// `doc-load` and `chat-roundtrip`, which ARE findings and do nudge; a server that
+// blinked for thirty seconds should say nothing. The suppression is recorded as
+// `probe-setup-failed` in the heartbeat either way, so a roster read that fails
+// forever is still visible to anyone looking.
 async function fleetTableRows(filter) {
-  const res = await fetch(`${FLEET_SERVER}/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`, {
-    signal: AbortSignal.timeout(ROSTER_TIMEOUT_MS),
-  })
-  if (!res.ok) throw new Error(`fleet-table (${filter}) returned HTTP ${res.status}`)
-  const data = await res.json()
+  let res
+  try {
+    res = await fetch(`${FLEET_SERVER}/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`, {
+      signal: AbortSignal.timeout(ROSTER_TIMEOUT_MS),
+    })
+  } catch (e) {
+    throw new ProbeSetupError(`fleet-table (${filter}) did not answer: ${e.message}`)
+  }
+  if (!res.ok) throw new ProbeSetupError(`fleet-table (${filter}) returned HTTP ${res.status}`)
+  let data
+  try {
+    data = await res.json()
+  } catch (e) {
+    throw new ProbeSetupError(`fleet-table (${filter}) returned invalid JSON: ${e.message}`)
+  }
   return Array.isArray(data?.agents) ? data.agents : []
 }
 
@@ -753,7 +775,7 @@ async function lastProducedAt(agentId) {
   const result = await sendRequest({
     type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId,
     historyOnly: true, role: 'assistant', limit: 1,
-  }, 10_000)
+  }, 10_000).catch(e => { throw new ProbeSetupError(`session history for ${agentId} did not answer: ${e.message}`) })
   const rows = (Array.isArray(result?.results) ? result.results : []).filter(r => r.source === 'session')
   return rows[0]?.timestamp || null
 }
@@ -767,7 +789,7 @@ async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
   const result = await sendRequest({
     type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId, agentOnly: true,
     historyOnly: true, eventOnly: true, eventType: 'chat', since: sinceIso, limit: 50,
-  }, 10_000)
+  }, 10_000).catch(e => { throw new ProbeSetupError(`chat history for ${agentId} did not answer: ${e.message}`) })
   const rows = (Array.isArray(result?.results) ? result.results : []).filter(r => r.source === 'fleet')
   const received = rows.filter(row =>
     row.from && row.from !== agentId && !botIds.has(row.from) &&
@@ -805,6 +827,14 @@ export async function checkAgentReceiving() {
     agentWatchRecord('receiving', result, null)
     return result
   } catch (e) {
+    // A setup failure is not cached and does not hold the cadence. Caching it
+    // would replay a transient -- a deploy window's HTTP 502 -- for the whole
+    // five-minute window, and the replay path reconstructs a plain Error, which
+    // would launder it into a real finding and nudge on-call about a blip.
+    if (e instanceof ProbeSetupError) {
+      agentWatchState.delete('receiving')
+      throw e
+    }
     agentWatchRecord('receiving', null, e?.message || String(e))
     throw e
   }
