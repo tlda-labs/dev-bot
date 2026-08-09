@@ -77,9 +77,7 @@ export const configSchema = defineConfig({
   statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
   agentSilenceWindowMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS', default: 7_200_000, description: 'How long an agent may hold a delivered message without producing anything before it is reported silent.', parse: configTypes.integer, validate: positive },
   agentSilenceLookbackMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS', default: 86_400_000, description: 'How far back to look for the delivery that an agent is silent on.', parse: configTypes.integer, validate: positive },
-  channelSilenceWindowMs: { env: 'TLDA_DEV_BOT_CHANNEL_SILENCE_WINDOW_MS', default: 600_000, description: 'How long an awake agent may hold no open fleet socket before it is reported off-channel.', parse: configTypes.integer, validate: positive },
-  channelReportEnabled: { env: 'TLDA_DEV_BOT_CHANNEL_REPORT_ENABLED', default: false, description: 'Whether the off-channel observation notifies. Off until its false-positive rate has been measured live.', parse: configTypes.boolean },
-  agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence and channel checks, which each cost one whole-roster read.', parse: configTypes.integer, validate: positive },
+  agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence check, which costs one whole-roster read.', parse: configTypes.integer, validate: positive },
   serverImportsRepo: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_REPO', default: '', description: 'tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.', parse: configTypes.string },
   serverImportsIntervalMs: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS', default: 600_000, description: 'Cadence for the server import resolution check.', parse: configTypes.integer, validate: positive },
   botHeartbeatStaleMs: { env: 'TLDA_DEV_BOT_BOT_HEARTBEAT_STALE_MS', default: 900_000, description: 'How long a bot declared for this environment may go without writing a heartbeat before it is reported inert.', parse: configTypes.integer, validate: positive },
@@ -98,8 +96,6 @@ const {
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
   agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
-  channelSilenceWindowMs: CHANNEL_SILENCE_WINDOW_MS,
-  channelReportEnabled: CHANNEL_REPORT_ENABLED,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
   serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
   daemonLedgerDb: DAEMON_LEDGER_DB, botHeartbeatStaleMs: BOT_HEARTBEAT_STALE_MS,
@@ -780,7 +776,7 @@ async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
   return received[0] || null
 }
 
-// One roster read per check per cadence window. `lastResult` is replayed on a
+// One roster read per cadence window. `lastResult` is replayed on a
 // skipped sweep rather than reporting `skipped`, so a standing failure keeps
 // failing between reads instead of alternating red/green every minute.
 const agentWatchState = new Map()
@@ -862,7 +858,6 @@ async function runAgentReceiving() {
       lastSeenAgoS: row.last_seen_ago_s,
       activity: row.activity || null,
       tool: row.tool || null,
-      socketOpen: row.client_socket_open ?? null,
       placeable: daemonCanPlace(row.id),
     })
   }
@@ -877,7 +872,7 @@ async function runAgentReceiving() {
       `- holding a message from \`${entry.from}\` delivered ${entry.deliveredAt}`,
       `- last produced: ${entry.lastProducedAt || 'nothing on record'}`,
       `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
-      `- daemon last saw the process ${entry.lastSeenAgoS}s ago${entry.socketOpen === null ? '' : `; own client socket ${entry.socketOpen ? 'open' : 'absent'}`}`,
+      `- daemon last saw the process ${entry.lastSeenAgoS}s ago`,
       entry.placeable === false
         ? '- **no `permission_grants` row for this daemon — it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.** Recovery is `tmux kill-session` plus an operator wake.'
         : entry.placeable === null ? '- daemon placement: not measured (ledger unreadable)' : null,
@@ -888,82 +883,6 @@ async function runAgentReceiving() {
     throw new Error(`${preface}${lines}`)
   }
   return { watched: rows.length, queried: candidates.length, windowMin: Math.round(AGENT_SILENCE_WINDOW_MS / 60_000) }
-}
-
-// An agent that is merely busy inside a long tool call still holds its own
-// client socket — ResilientWS heartbeats every 45s independently of the model.
-// An agent whose client wedged, died, or never initialised does not. That is the
-// only fast discriminator available from outside, and it is why this exists
-// beside the slow check above rather than instead of it.
-//
-// It reads `client_socket_open`, NOT the `fleet_socket_open` this bot asked for
-// first. That one counted any socket labelled with the agent's id, and
-// `reserve-shell` labels the CALLER's socket when waking someone else — so two
-// agents with no tlda MCP at all read as connected on its first observation.
-// The rename is the whole correction; see the comment on hasOwnClientSocketForAgent.
-//
-// Absence has to persist: a reconnect leaves the socket briefly absent during
-// normal operation, so first-absence is recorded here and only an agent absent
-// for the whole window is reported.
-const channelAbsentSince = new Map()
-
-export async function checkAgentChannel() {
-  if (!agentWatchDue('channel')) return agentWatchReplay('channel')
-  try {
-    const result = await runAgentChannel()
-    agentWatchRecord('channel', result, null)
-    return result
-  } catch (e) {
-    agentWatchRecord('channel', null, e?.message || String(e))
-    throw e
-  }
-}
-
-async function runAgentChannel() {
-  const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
-  if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
-  if (!rows.some(row => Object.hasOwn(row, 'client_socket_open'))) {
-    channelAbsentSince.clear()
-    return { skipped: true, blocked: true, reason: 'server does not send client_socket_open' }
-  }
-
-  const now = Date.now()
-  const seen = new Set()
-  const offChannel = []
-  for (const row of rows) {
-    seen.add(row.id)
-    if (row.client_socket_open !== false) { channelAbsentSince.delete(row.id); continue }
-    if (!channelAbsentSince.has(row.id)) channelAbsentSince.set(row.id, now)
-    const since = channelAbsentSince.get(row.id)
-    if (now - since < CHANNEL_SILENCE_WINDOW_MS) continue
-    offChannel.push({
-      id: row.id,
-      name: row.name || row.id,
-      absentForMin: Math.round((now - since) / 60_000),
-      lastClientCallAt: row.activity_at ?? null,
-      lastSeenAgoS: row.last_seen_ago_s,
-      activity: row.activity || null,
-      tool: row.tool || null,
-    })
-  }
-  for (const id of [...channelAbsentSince.keys()]) if (!seen.has(id)) channelAbsentSince.delete(id)
-
-  const detail = { watched: rows.length, offChannel: offChannel.map(entry => `${entry.name}:${entry.absentForMin}m`) }
-  // Observation only until the live false-positive rate is measured. The count
-  // is written to the heartbeat every sweep so the rate is measurable without
-  // anyone being nudged in the meantime.
-  if (!CHANNEL_REPORT_ENABLED) {
-    writeHeartbeat('channel-observation', detail)
-    return { ...detail, reporting: false }
-  }
-  if (offChannel.length) {
-    throw new Error(offChannel.map(entry => [
-      `**${entry.name}** (\`${entry.id}\`) has held no fleet socket for ${entry.absentForMin} minutes while its process is reported alive.`,
-      `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
-      `- daemon last saw the process ${entry.lastSeenAgoS}s ago`,
-    ].join('\n')).join('\n\n'))
-  }
-  return { ...detail, reporting: true }
 }
 
 // The only check here that is not about a running system. It is a static read of
@@ -1105,7 +1024,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'agent-channel', 'server-imports', 'bot-heartbeats']
+const REQUIRED_CHECKS = ['doc-load', 'chat-roundtrip', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'server-imports', 'bot-heartbeats']
 
 async function runChecks() {
   const results = []
@@ -1115,7 +1034,6 @@ async function runChecks() {
     ['spawn-wake-seat', checkSpawnWakeSeat],
     ['linked-remote-safety', checkLinkedRemoteSafety],
     ['agent-receiving', checkAgentReceiving],
-    ['agent-channel', checkAgentChannel],
     ['server-imports', checkServerImportResolution],
     ['bot-heartbeats', checkBotHeartbeats],
   ]) {
