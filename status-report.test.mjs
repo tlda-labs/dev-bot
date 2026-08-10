@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
 process.env.TLDA_DEV_BOT_NO_START = '1'
-const { configSchema, publishStatus, renderStatusMarkdown } = await import('./dev-bot.mjs')
+const { configSchema, publishMiniLoadReport, publishStatus, renderMiniLoadMarkdown, renderStatusMarkdown } = await import('./dev-bot.mjs')
 
 test('linked remote safety probe is explicit opt-in', () => {
   assert.equal(configSchema.fields.linkedRemoteEnabled.default, false)
@@ -49,6 +49,61 @@ test('status publication uses the info project source pipeline and exposes failu
 
   await assert.rejects(
     publishStatus({ transport: { sendAndWait: async () => ({ ok: false, error: 'refused' }) }, samples: [] }),
+    /refused/,
+  )
+})
+
+test('Mini load Markdown is semantic, reassuring, timestamped, provenance-bearing, and charted', () => {
+  const report = renderMiniLoadMarkdown({
+    generatedAt: '2026-08-10T03:00:30.000Z',
+    machine: 'mini',
+    cores: 10,
+    fleet: { awakeAgents: 12, botAgents: 3, humanAgents: 1 },
+    tmux: { total: 14, fleet: 9, playwright: 2 },
+    samples: [{
+      ts: '2026-08-10T03:00:00.000Z',
+      load1: 2.4,
+      load5: 2.8,
+      load15: 3.1,
+      cpuBusyPercent: 18.5,
+      memoryUsedBytes: 8 * 1024 ** 3,
+      memoryTotalBytes: 24 * 1024 ** 3,
+      memoryUsedPercent: 33.3,
+      eventLoopLagMs: 4.2,
+    }],
+  })
+  assert.match(report, /^# Mini load report \{\.volatile\}/)
+  assert.match(report, /The Mini is running comfortably/)
+  assert.match(report, /Provenance:/)
+  assert.match(report, /\| Awake fleet agents \| 12 \|/)
+  assert.match(report, /\| Tmux sessions \| 14 total, 9 fleet, 2 Playwright pool \|/)
+  assert.match(report, /<svg[\s\S]*Mini load timeline/)
+})
+
+test('Mini load publication uses the info project source pipeline and exposes failure', async () => {
+  let request
+  const transport = {
+    sendAndWait: async message => {
+      request = message
+      return { ok: true }
+    },
+  }
+  const report = {
+    generatedAt: '2026-08-10T03:00:30.000Z',
+    machine: 'mini',
+    cores: 10,
+    fleet: { awakeAgents: 12, botAgents: 3, humanAgents: 1 },
+    tmux: { total: 14, fleet: 9, playwright: 2 },
+    samples: [],
+  }
+  assert.match(await publishMiniLoadReport({ transport, report }), /^\[Mini load report\]\(\/docs\/info\//)
+  assert.equal(request.type, 'source-change')
+  assert.equal(request.project, 'info')
+  assert.equal(request.files[0].path, 'mini-load-report.md')
+  assert.match(request.files[0].content, /^# Mini load report \{\.volatile\}/)
+
+  await assert.rejects(
+    publishMiniLoadReport({ transport: { sendAndWait: async () => ({ ok: false, error: 'refused' }) }, report }),
     /refused/,
   )
 })

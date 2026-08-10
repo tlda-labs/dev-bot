@@ -9,6 +9,7 @@
 
 import fs from 'fs'
 import path from 'path'
+import os from 'os'
 import { randomUUID } from 'crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { execFileSync } from 'child_process'
@@ -76,6 +77,9 @@ export const configSchema = defineConfig({
   resourceCleanupIntervalMs: { env: 'TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS', default: 60_000, description: 'Playwright cleanup cadence.', parse: configTypes.integer, validate: positive },
   worktreeCleanupIntervalMs: { env: 'TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS', default: 3_600_000, description: 'Worktree cleanup cadence.', parse: configTypes.integer, validate: positive },
   statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
+  loadReportFile: { env: 'TLDA_DEV_BOT_LOAD_REPORT_FILE', default: 'mini-load-report.md', description: 'Project-relative volatile Mini load report Markdown path.', parse: configTypes.string },
+  loadReportSamples: { env: 'TLDA_DEV_BOT_LOAD_REPORT_SAMPLES', default: 7, description: 'Number of local load samples captured for an on-demand Mini load report.', parse: configTypes.integer, validate: positive },
+  loadReportSampleIntervalMs: { env: 'TLDA_DEV_BOT_LOAD_REPORT_SAMPLE_INTERVAL_MS', default: 5_000, description: 'Delay between local load samples in the on-demand Mini load report.', parse: configTypes.integer, validate: positive },
   agentSilenceWindowMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS', default: 7_200_000, description: 'How long an agent may hold a delivered message without producing anything before it is reported silent.', parse: configTypes.integer, validate: positive },
   agentSilenceLookbackMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS', default: 86_400_000, description: 'How far back to look for the delivery that an agent is silent on.', parse: configTypes.integer, validate: positive },
   agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence check, which costs one whole-roster read.', parse: configTypes.integer, validate: positive },
@@ -99,6 +103,7 @@ const {
   assetPathOverride: ASSET_PATH_OVERRIDE, allowNondefault: ALLOW_NONDEFAULT, nudgeTo: NUDGE_TO_OVERRIDE,
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
+  loadReportSamples: LOAD_REPORT_SAMPLES, loadReportSampleIntervalMs: LOAD_REPORT_SAMPLE_INTERVAL_MS,
   agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, agentJoinGraceMs: AGENT_JOIN_GRACE_MS,
   rosterTimeoutMs: ROSTER_TIMEOUT_MS,
@@ -1937,6 +1942,213 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
 }
 
+function formatPercent(value) {
+  if (!Number.isFinite(value)) return 'n/a'
+  return `${value.toFixed(1)}%`
+}
+
+function cpuTotals(cpus = os.cpus()) {
+  let idle = 0
+  let total = 0
+  for (const cpu of cpus) {
+    for (const value of Object.values(cpu.times)) total += value
+    idle += cpu.times.idle
+  }
+  return { idle, total }
+}
+
+function cpuBusyPercent(previous, current) {
+  if (!previous || !current) return null
+  const total = current.total - previous.total
+  const idle = current.idle - previous.idle
+  if (total <= 0) return null
+  return Math.max(0, Math.min(100, (1 - idle / total) * 100))
+}
+
+async function measureEventLoopLagMs({ delayMs = 100, clock = () => performance.now(), timer = setTimeout } = {}) {
+  const started = clock()
+  return new Promise(resolve => {
+    timer(() => resolve(Math.max(0, clock() - started - delayMs)), delayMs)
+  })
+}
+
+function readTmuxSessionCounts({ run = execFileSync } = {}) {
+  try {
+    const output = run('tmux', ['list-sessions', '-F', '#{session_name}'], {
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+    const sessions = output.split('\n').map(line => line.trim()).filter(Boolean)
+    return {
+      total: sessions.length,
+      fleet: sessions.filter(name => name.startsWith('fleet-')).length,
+      playwright: sessions.filter(name => name === 'shared' || name.startsWith('shared-')).length,
+    }
+  } catch (e) {
+    return { total: null, fleet: null, playwright: null, error: e?.message || String(e) }
+  }
+}
+
+async function readFleetLoadContext({ rows = fleetTableRows } = {}) {
+  try {
+    const awake = await rows('awake')
+    return {
+      awakeAgents: awake.length,
+      botAgents: awake.filter(row => Array.isArray(row.labels) && row.labels.includes('bot')).length,
+      humanAgents: awake.filter(row => row.human).length,
+    }
+  } catch (e) {
+    return { awakeAgents: null, botAgents: null, humanAgents: null, error: e?.message || String(e) }
+  }
+}
+
+function loadState(latest, cores) {
+  if (!latest) return 'No completed load sample is available yet.'
+  const perCoreLoad = cores ? latest.load1 / cores : latest.load1
+  const busy = Number.isFinite(latest.cpuBusyPercent) ? latest.cpuBusyPercent : 0
+  const lag = Number.isFinite(latest.eventLoopLagMs) ? latest.eventLoopLagMs : 0
+  if (perCoreLoad < 0.7 && busy < 70 && latest.memoryUsedPercent < 85) {
+    return 'The Mini is running comfortably in this window.'
+  }
+  if (perCoreLoad < 1.2 && busy < 85 && lag < 50) {
+    return 'The Mini is carrying load but staying responsive in this window.'
+  }
+  return 'The Mini is busy enough to show up in this window.'
+}
+
+export async function collectMiniLoadSamples({
+  count = LOAD_REPORT_SAMPLES,
+  intervalMs = LOAD_REPORT_SAMPLE_INTERVAL_MS,
+  loadavg = () => os.loadavg(),
+  totalmem = () => os.totalmem(),
+  freemem = () => os.freemem(),
+  cpus = () => os.cpus(),
+  hostname = () => os.hostname(),
+  now = () => new Date(),
+  context = () => Promise.all([readFleetLoadContext(), Promise.resolve(readTmuxSessionCounts())]),
+  lag = () => measureEventLoopLagMs(),
+  wait = sleep,
+} = {}) {
+  const startedAt = now().toISOString()
+  const machine = hostname()
+  const cores = cpus().length || 1
+  const [fleet, tmux] = await context()
+  const samples = []
+  let previousCpu = cpuTotals(cpus())
+  for (let index = 0; index < count; index++) {
+    if (index > 0) await wait(intervalMs)
+    const currentCpu = cpuTotals(cpus())
+    const totalBytes = totalmem()
+    const freeBytes = freemem()
+    const usedBytes = Math.max(0, totalBytes - freeBytes)
+    const [load1, load5, load15] = loadavg()
+    samples.push({
+      ts: now().toISOString(),
+      load1,
+      load5,
+      load15,
+      cpuBusyPercent: cpuBusyPercent(previousCpu, currentCpu),
+      memoryUsedBytes: usedBytes,
+      memoryTotalBytes: totalBytes,
+      memoryUsedPercent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0,
+      eventLoopLagMs: await lag(),
+    })
+    previousCpu = currentCpu
+  }
+  return { startedAt, generatedAt: now().toISOString(), machine, cores, fleet, tmux, samples }
+}
+
+function svgPoint({ sample, index, samples, width, height, maxY, value }) {
+  const x = samples.length <= 1 ? width / 2 : 38 + index * (width - 76) / (samples.length - 1)
+  const y = height - 28 - (Math.max(0, value) / maxY) * (height - 58)
+  return { x: x.toFixed(1), y: y.toFixed(1), sample }
+}
+
+function renderSeries(points, key, color, label) {
+  const usable = points.filter(point => Number.isFinite(point.sample[key]))
+  if (!usable.length) return ''
+  const line = usable.map(point => `${point.x},${point.y}`).join(' ')
+  return [
+    `<polyline fill="none" stroke="${color}" stroke-width="3" points="${line}"><title>${label}</title></polyline>`,
+    ...usable.map(point => `<circle cx="${point.x}" cy="${point.y}" r="4" fill="${color}"><title>${point.sample.ts}: ${label} ${formatPercent(point.sample[key])}</title></circle>`),
+  ].join('\n  ')
+}
+
+function renderMiniLoadChart(report) {
+  const samples = report.samples || []
+  const width = 760
+  const height = 260
+  const projected = samples.map(sample => ({
+    ...sample,
+    loadPerCorePercent: report.cores > 0 ? sample.load1 / report.cores * 100 : sample.load1 * 100,
+  }))
+  const maxY = Math.max(100, ...projected.flatMap(sample => [
+    sample.loadPerCorePercent,
+    Number.isFinite(sample.cpuBusyPercent) ? sample.cpuBusyPercent : 0,
+    sample.memoryUsedPercent,
+  ]))
+  const points = projected.map((sample, index) => svgPoint({ sample, index, samples: projected, width, height, maxY, value: sample.loadPerCorePercent }))
+  const cpuPoints = projected.map((sample, index) => svgPoint({ sample, index, samples: projected, width, height, maxY, value: sample.cpuBusyPercent || 0 }))
+  const memoryPoints = projected.map((sample, index) => svgPoint({ sample, index, samples: projected, width, height, maxY, value: sample.memoryUsedPercent }))
+  const y100 = height - 28 - (100 / maxY) * (height - 58)
+  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Mini load timeline" style="max-width:100%;background:#fafafa;border:1px solid #ddd">
+  <line x1="38" y1="${y100.toFixed(1)}" x2="${width - 38}" y2="${y100.toFixed(1)}" stroke="#bbb" stroke-dasharray="4 4"/>
+  <text x="42" y="${Math.max(14, y100 - 6).toFixed(1)}" font-size="12" fill="#555">100%</text>
+  ${renderSeries(points, 'loadPerCorePercent', '#2563eb', '1 min load per core')}
+  ${renderSeries(cpuPoints, 'cpuBusyPercent', '#dc2626', 'CPU busy')}
+  ${renderSeries(memoryPoints, 'memoryUsedPercent', '#16a34a', 'memory used')}
+  <g font-size="12" fill="#333">
+    <rect x="40" y="${height - 20}" width="10" height="10" fill="#2563eb"/><text x="55" y="${height - 11}">load/core</text>
+    <rect x="145" y="${height - 20}" width="10" height="10" fill="#dc2626"/><text x="160" y="${height - 11}">CPU</text>
+    <rect x="220" y="${height - 20}" width="10" height="10" fill="#16a34a"/><text x="235" y="${height - 11}">memory</text>
+  </g>
+</svg>`
+}
+
+export function renderMiniLoadMarkdown(report) {
+  const samples = report.samples || []
+  const latest = samples.at(-1)
+  const fleet = report.fleet || {}
+  const tmux = report.tmux || {}
+  return [
+    '# Mini load report {.volatile}',
+    '',
+    loadState(latest, report.cores),
+    '',
+    `Generated: ${report.generatedAt}`,
+    '',
+    `Machine: ${report.machine || 'unknown'} (${report.cores || 'unknown'} CPU cores).`,
+    '',
+    'Provenance: local `os.loadavg()`, `os.cpus()`, `os.totalmem()`, `os.freemem()`, one event-loop lag timer, `tmux list-sessions`, and the fleet `awake` roster. The inline SVG is used so the report remains ordinary draggable markdown without a separate build step.',
+    '',
+    '## Current snapshot',
+    '',
+    '| Metric | Value |',
+    '|---|---:|',
+    `| 1 min load average | ${latest ? latest.load1.toFixed(2) : 'n/a'} |`,
+    `| 5 min load average | ${latest ? latest.load5.toFixed(2) : 'n/a'} |`,
+    `| 15 min load average | ${latest ? latest.load15.toFixed(2) : 'n/a'} |`,
+    `| CPU busy | ${latest ? formatPercent(latest.cpuBusyPercent) : 'n/a'} |`,
+    `| Memory used | ${latest ? `${formatBytes(latest.memoryUsedBytes)} / ${formatBytes(latest.memoryTotalBytes)} (${formatPercent(latest.memoryUsedPercent)})` : 'n/a'} |`,
+    `| Event-loop lag | ${latest ? `${latest.eventLoopLagMs.toFixed(1)} ms` : 'n/a'} |`,
+    `| Awake fleet agents | ${fleet.awakeAgents ?? 'n/a'} |`,
+    `| Awake bot agents | ${fleet.botAgents ?? 'n/a'} |`,
+    `| Tmux sessions | ${tmux.total ?? 'n/a'} total, ${tmux.fleet ?? 'n/a'} fleet, ${tmux.playwright ?? 'n/a'} Playwright pool |`,
+    '',
+    '## Timeline',
+    '',
+    renderMiniLoadChart(report),
+    '',
+    '## Samples',
+    '',
+    '| Timestamp | Load 1m | Load 5m | Load 15m | CPU busy | Memory used | Event-loop lag |',
+    '|---|---:|---:|---:|---:|---:|---:|',
+    ...samples.map(sample => `| ${sample.ts} | ${sample.load1.toFixed(2)} | ${sample.load5.toFixed(2)} | ${sample.load15.toFixed(2)} | ${formatPercent(sample.cpuBusyPercent)} | ${formatPercent(sample.memoryUsedPercent)} | ${sample.eventLoopLagMs.toFixed(1)} ms |`),
+    ...(fleet.error ? ['', `Fleet roster note: ${fleet.error}`] : []),
+    ...(tmux.error ? ['', `Tmux note: ${tmux.error}`] : []),
+  ].join('\n')
+}
+
 export function renderStatusMarkdown(samples = statusSamples) {
   const generatedAt = new Date().toISOString()
   const latest = samples.at(-1)
@@ -1992,6 +2204,24 @@ export async function publishStatus({ transport = bot, samples = statusSamples }
   return `[Dev bot disk and worktree status](/docs/info/${encodeURIComponent(config.statusFile.replace(/\.md$/i, '.html'))})`
 }
 
+export async function publishMiniLoadReport({
+  transport = bot,
+  report = null,
+  collect = collectMiniLoadSamples,
+} = {}) {
+  const current = report || await collect()
+  const requestId = `mini-load:${randomUUID()}`
+  const result = await transport.sendAndWait({
+    type: 'source-change',
+    project: 'info',
+    files: [{ path: config.loadReportFile, content: renderMiniLoadMarkdown(current) }],
+    editedBy: AGENT_ID,
+    requestId,
+  }, message => message.type === 'source-change-result' && message.requestId === requestId, REQUEST_TIMEOUT_MS)
+  if (!result.ok) throw new Error(result.error || `source update failed (${result.status || result.httpStatus})`)
+  return `[Mini load report](/docs/info/${encodeURIComponent(config.loadReportFile.replace(/\.md$/i, '.html'))})`
+}
+
 export const commands = [{
   name: 'status',
   summary: 'Publish and return the current disk/worktree status report.',
@@ -1999,6 +2229,14 @@ export const commands = [{
   examples: ['status'],
   handler: async ({ reply }) => {
     await reply(await publishStatus())
+  },
+}, {
+  name: 'load',
+  summary: 'Publish and return the current Mini load report.',
+  help: 'Samples local CPU, load average, memory, event-loop lag, fleet agents, and tmux sessions into a semantic Markdown report with an inline timeline chart.',
+  examples: ['load'],
+  handler: async ({ reply }) => {
+    await reply(await publishMiniLoadReport())
   },
 }]
 

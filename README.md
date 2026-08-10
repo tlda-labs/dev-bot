@@ -39,6 +39,16 @@ Writes the current semantic Markdown report and interactive timeline to the ordi
 Examples:
 
 - `status`
+
+### `load`
+
+Publish and return the current Mini load report.
+
+Samples local CPU, load average, memory, event-loop lag, fleet agents, and tmux sessions into a semantic Markdown report with an inline timeline chart.
+
+Examples:
+
+- `load`
 <!-- END GENERATED COMMANDS -->
 
 ## Configuration
@@ -69,6 +79,9 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS` (resourceCleanupIntervalMs; default: `60000`) — Playwright cleanup cadence.
 - `TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS` (worktreeCleanupIntervalMs; default: `3600000`) — Worktree cleanup cadence.
 - `TLDA_DEV_BOT_STATUS_FILE` (statusFile; default: `"dev-bot-status.md"`) — Project-relative volatile status Markdown path.
+- `TLDA_DEV_BOT_LOAD_REPORT_FILE` (loadReportFile; default: `"mini-load-report.md"`) — Project-relative volatile Mini load report Markdown path.
+- `TLDA_DEV_BOT_LOAD_REPORT_SAMPLES` (loadReportSamples; default: `7`) — Number of local load samples captured for an on-demand Mini load report.
+- `TLDA_DEV_BOT_LOAD_REPORT_SAMPLE_INTERVAL_MS` (loadReportSampleIntervalMs; default: `5000`) — Delay between local load samples in the on-demand Mini load report.
 - `TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS` (agentSilenceWindowMs; default: `7200000`) — How long an agent may hold a delivered message without producing anything before it is reported silent.
 - `TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS` (agentSilenceLookbackMs; default: `86400000`) — How far back to look for the delivery that an agent is silent on.
 - `TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS` (agentWatchIntervalMs; default: `300000`) — Cadence for the agent silence check, which costs one whole-roster read.
