@@ -12,6 +12,7 @@ const {
   checkMessageRoundTrip,
   checkMcpSurface,
   checkBotHeartbeats,
+  checkMisconfiguredAgents,
   checkResourceCleanup,
   runChecks,
 } = await import('./dev-bot.mjs')
@@ -143,6 +144,29 @@ await expectRed(
     })
   },
   /alive but deaf/,
+)
+
+await expectRed(
+  '8 misconfigured agent join coherence',
+  async () => checkMisconfiguredAgents({
+    mintRows: [{
+      mint_id: 'red-missing-grant',
+      fleet_id: 'fleet:red-missing-grant',
+      friendly_name: 'red-missing-grant',
+      process_state: JSON.stringify({
+        session_id: 'session-red',
+        tmux_session: 'fleet-red-missing-grant',
+        env_name: 'testing',
+        daemon_key: 'mini:testing',
+      }),
+      session_id: 'session-red',
+      created_at: '2026-08-10T00:00:00.000Z',
+    }],
+    grantRows: [],
+    now: () => Date.parse('2026-08-10T00:10:00.000Z'),
+    joinGraceMs: 5 * 60_000,
+  }),
+  /no `permission_grants` row/,
 )
 
 const strayDir = await mkdtemp(path.join(tmpdir(), 'devbot-red-cleanup-'))

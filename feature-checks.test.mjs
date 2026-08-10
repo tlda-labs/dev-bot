@@ -10,6 +10,7 @@ const {
   checkDocumentRenders,
   checkMcpSurface,
   checkBotHeartbeats,
+  checkMisconfiguredAgents,
   checkResourceCleanup,
   runChecks,
 } = await import('./dev-bot.mjs')
@@ -302,6 +303,79 @@ test('blocked checks are carried into the sweep report', async () => {
   })
   assert.equal(report.ok, true)
   assert.ok(report.blocked.includes('bot-heartbeats:synthetic missing heartbeat instrument'))
+})
+
+test('misconfigured agent check detects stranded async joins but ignores young mints', async () => {
+  const old = '2026-08-10T00:00:00.000Z'
+  const young = '2026-08-10T00:09:30.000Z'
+  const now = () => Date.parse('2026-08-10T00:10:00.000Z')
+  const complete = {
+    mint_id: 'complete-mint',
+    fleet_id: 'fleet:complete',
+    friendly_name: 'complete',
+    process_state: JSON.stringify({ session_id: 'session-complete', tmux_session: 'fleet-complete', env_name: 'testing', daemon_key: 'mini:testing' }),
+    session_id: 'session-complete',
+    created_at: old,
+  }
+  const result = await checkMisconfiguredAgents({
+    mintRows: [
+      complete,
+      {
+        mint_id: 'young-mint',
+        fleet_id: 'fleet:young',
+        friendly_name: 'young',
+        process_state: null,
+        session_id: null,
+        created_at: young,
+      },
+    ],
+    grantRows: [{ id: 'fleet:complete', session_id: 'session-complete', daemon_key: 'mini:testing', env_name: 'testing' }],
+    now,
+    joinGraceMs: 5 * 60_000,
+  })
+  assert.equal(result.checked, 2)
+  assert.equal(result.young, 1)
+
+  await assert.rejects(
+    checkMisconfiguredAgents({
+      mintRows: [
+        complete,
+        {
+          mint_id: 'missing-grant-mint',
+          fleet_id: 'fleet:missing-grant',
+          friendly_name: 'missing-grant',
+          process_state: JSON.stringify({ session_id: 'session-missing', tmux_session: 'fleet-missing-grant', env_name: 'testing', daemon_key: 'mini:testing' }),
+          session_id: 'session-missing',
+          created_at: old,
+        },
+        {
+          mint_id: 'no-process-mint',
+          fleet_id: 'fleet:no-process',
+          friendly_name: 'no-process',
+          process_state: null,
+          session_id: null,
+          created_at: old,
+        },
+        {
+          mint_id: 'mcp-never-joined-mint',
+          fleet_id: 'fleet:mcp-never-joined',
+          friendly_name: 'mcp-never-joined',
+          process_state: JSON.stringify({ tmux_session: 'fleet-mcp-never-joined', env_name: 'testing', daemon_key: 'mini:testing' }),
+          session_id: null,
+          created_at: old,
+        },
+      ],
+      grantRows: [
+        { id: 'fleet:complete', session_id: 'session-complete', daemon_key: 'mini:testing', env_name: 'testing' },
+        { id: 'fleet:no-process', session_id: null, daemon_key: 'mini:testing', env_name: 'testing' },
+        { id: 'fleet:mcp-never-joined', session_id: null, daemon_key: 'mini:testing', env_name: 'testing' },
+      ],
+      now,
+      joinGraceMs: 5 * 60_000,
+      sessionExists: session => session === 'fleet-mcp-never-joined',
+    }),
+    /no `permission_grants` row[\s\S]*no process_state and no session_id[\s\S]*tmux session still exists/,
+  )
 })
 
 test('resource cleanup reports inventory failures instead of only logging them', async () => {

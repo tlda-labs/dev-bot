@@ -79,10 +79,12 @@ export const configSchema = defineConfig({
   agentSilenceWindowMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS', default: 7_200_000, description: 'How long an agent may hold a delivered message without producing anything before it is reported silent.', parse: configTypes.integer, validate: positive },
   agentSilenceLookbackMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS', default: 86_400_000, description: 'How far back to look for the delivery that an agent is silent on.', parse: configTypes.integer, validate: positive },
   agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence check, which costs one whole-roster read.', parse: configTypes.integer, validate: positive },
+  agentJoinGraceMs: { env: 'TLDA_DEV_BOT_AGENT_JOIN_GRACE_MS', default: 300_000, description: 'Minimum mint age before an incomplete agent join is reported stranded.', parse: configTypes.integer, validate: positive },
   serverImportsRepo: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_REPO', default: '', description: 'tlda checkout whose server boot path is checked against the shipped dependency manifest. Empty disables the check.', parse: configTypes.string },
   serverImportsIntervalMs: { env: 'TLDA_DEV_BOT_SERVER_IMPORTS_INTERVAL_MS', default: 600_000, description: 'Cadence for the server import resolution check.', parse: configTypes.integer, validate: positive },
   botHeartbeatStaleMs: { env: 'TLDA_DEV_BOT_BOT_HEARTBEAT_STALE_MS', default: 900_000, description: 'How long a bot declared for this environment may go without writing a heartbeat before it is reported inert.', parse: configTypes.integer, validate: positive },
   healthStateDb: { env: 'TLDA_DEV_BOT_HEALTH_STATE_DB', default: path.join(CONFIG_DIR, `${BOT_KEY}.${CONFIG_NAME}.health.sqlite`), description: 'Small local SQLite current-state file for bot health; append-only heartbeats remain the history.', parse: configTypes.string },
+  daemonMintDb: { env: 'TLDA_DEV_BOT_DAEMON_MINT_DB', default: path.join(CONFIG_DIR, 'daemon-mints.sqlite'), description: 'Local daemon mint store, read to detect incomplete async agent joins.', parse: configTypes.string },
   daemonLedgerDb: { env: 'TLDA_DEV_BOT_DAEMON_LEDGER_DB', default: path.join(CONFIG_DIR, 'fleet-daemon.db'), description: 'Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.', parse: configTypes.string },
   rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
 })
@@ -98,9 +100,11 @@ const {
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
   agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
-  agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, rosterTimeoutMs: ROSTER_TIMEOUT_MS,
+  agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, agentJoinGraceMs: AGENT_JOIN_GRACE_MS,
+  rosterTimeoutMs: ROSTER_TIMEOUT_MS,
   serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
-  daemonLedgerDb: DAEMON_LEDGER_DB, botHeartbeatStaleMs: BOT_HEARTBEAT_STALE_MS,
+  daemonLedgerDb: DAEMON_LEDGER_DB, daemonMintDb: DAEMON_MINT_DB,
+  botHeartbeatStaleMs: BOT_HEARTBEAT_STALE_MS,
   healthStateDb: HEALTH_STATE_DB,
 } = config
 const DAEMON_KEY = process.env.FLEET_DAEMON_KEY || `${process.env.TLDA_BOT_MACHINE_ID || process.env.TLDA_MACHINE_ID || ''}:${CONFIG_NAME}`
@@ -1037,6 +1041,16 @@ function hasLocalSession(name) {
   }
 }
 
+function tmuxSessionExists(sessionName) {
+  if (!sessionName) return null
+  try {
+    execFileSync('tmux', ['has-session', '-t', sessionName], { stdio: 'ignore', timeout: 5000 })
+    return true
+  } catch (e) {
+    return e?.status === 1 ? false : null
+  }
+}
+
 let _daemonLedger = null
 let _daemonLedgerFailed = false
 function daemonLedger() {
@@ -1177,6 +1191,144 @@ function agentWatchReplay(key) {
 
 function agentWatchRecord(key, value, error) {
   agentWatchState.set(key, { at: Date.now(), value, error })
+}
+
+function readJsonObject(text, context) {
+  if (!text) return null
+  try {
+    const value = JSON.parse(text)
+    return value && typeof value === 'object' && !Array.isArray(value) ? value : null
+  } catch (e) {
+    throw new ProbeSetupError(`${context} contains invalid JSON: ${e.message}`)
+  }
+}
+
+function readDaemonMintRows(dbPath = DAEMON_MINT_DB) {
+  try {
+    const db = new DatabaseSync(dbPath, { readOnly: true })
+    try {
+      return db.prepare(`SELECT
+        mint_id, fleet_id, friendly_name, metadata, launch_recipe, process_state,
+        session_id, session_path, joined_at, created_at, updated_at
+        FROM daemon_mints`).all()
+    } finally {
+      db.close()
+    }
+  } catch (e) {
+    throw new ProbeSetupError(`daemon mint store ${dbPath} could not be read: ${e.message}`)
+  }
+}
+
+function readDaemonGrantRows() {
+  try {
+    const db = daemonLedger()
+    if (!db) throw new Error('ledger did not open')
+    return db.prepare(`SELECT
+      id, permission_grant, updated_at, source, friendly_name, session_id,
+      session_kind, session_path, tmux_session, model, machine_id, env_name,
+      daemon_key, terminal_capability, cwd, last_seen
+      FROM permission_grants`).all() || []
+  } catch (e) {
+    throw new ProbeSetupError(`permission_grants ledger ${DAEMON_LEDGER_DB} could not be read: ${e.message}`)
+  }
+}
+
+function explicitMintEnv(row, processState, grant) {
+  const botEnv = String(row.mint_id || '').match(/^bot:([^:]+):/)?.[1] || null
+  return processState?.env_name || grant?.env_name || botEnv || null
+}
+
+function mintBelongsToConfig(row, processState, grant) {
+  const env = explicitMintEnv(row, processState, grant)
+  if (env && env !== CONFIG_NAME) return false
+  const daemonKey = processState?.daemon_key || grant?.daemon_key || null
+  if (daemonKey && daemonKey !== DAEMON_KEY) return false
+  return true
+}
+
+function ageMinutes(now, iso) {
+  const at = Date.parse(iso || '')
+  if (!Number.isFinite(at)) return null
+  return Math.round((now - at) / 60_000)
+}
+
+function agentLabel(row) {
+  return row.friendly_name || row.fleet_id || row.mint_id
+}
+
+function formatJoinFinding(row, reasons, ageMin) {
+  const id = row.fleet_id ? ` (\`${row.fleet_id}\`)` : ''
+  return [
+    `**${agentLabel(row)}**${id} has incoherent mint/daemon join state after ${ageMin} minutes.`,
+    ...reasons.map(reason => `- ${reason}`),
+  ].join('\n')
+}
+
+export async function checkMisconfiguredAgents({
+  mintRows = readDaemonMintRows(),
+  grantRows = readDaemonGrantRows(),
+  now = () => Date.now(),
+  joinGraceMs = AGENT_JOIN_GRACE_MS,
+  sessionExists = tmuxSessionExists,
+} = {}) {
+  const currentTime = now()
+  const grants = new Map(grantRows.filter(row => row?.id).map(row => [row.id, row]))
+  const findings = []
+  let checked = 0
+  let young = 0
+  for (const row of mintRows) {
+    const processState = readJsonObject(row.process_state, `mint ${row.mint_id} process_state`)
+    const grant = row.fleet_id ? grants.get(row.fleet_id) || null : null
+    if (!mintBelongsToConfig(row, processState, grant)) continue
+    checked += 1
+
+    const createdAt = Date.parse(row.created_at || '')
+    if (!Number.isFinite(createdAt)) {
+      throw new ProbeSetupError(`mint ${row.mint_id} has unreadable created_at ${JSON.stringify(row.created_at)}`)
+    }
+    if (currentTime - createdAt < joinGraceMs) {
+      young += 1
+      continue
+    }
+
+    const reasons = []
+    const rowSession = row.session_id || null
+    const processSession = processState?.session_id || null
+    const ageMin = ageMinutes(currentTime, row.created_at)
+    if (row.fleet_id && !grant) {
+      reasons.push('fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it')
+    }
+    if (row.fleet_id && !rowSession && !processSession) {
+      if (processState) {
+        const tmuxSession = processState.tmux_session || null
+        const exists = sessionExists(tmuxSession)
+        reasons.push(`process_state exists${tmuxSession ? ` for \`${tmuxSession}\`` : ''}, but no session_id ever joined${exists === true ? '; the tmux session still exists' : exists === false ? '; the tmux session is gone' : ''}`)
+      } else {
+        reasons.push('fleet seat exists, but the mint has no process_state and no session_id')
+      }
+    }
+    if (!row.fleet_id && processState) {
+      reasons.push('process_state exists, but no fleet seat was recorded')
+    }
+    if (grant && row.fleet_id && !grant.session_id) {
+      reasons.push('permission_grants row exists, but it has no session_id')
+    }
+    if (grant?.daemon_key && processState?.daemon_key && grant.daemon_key !== processState.daemon_key) {
+      reasons.push(`permission_grants daemon_key \`${grant.daemon_key}\` disagrees with process_state daemon_key \`${processState.daemon_key}\``)
+    }
+    if (reasons.length) findings.push(formatJoinFinding(row, reasons, ageMin))
+  }
+
+  if (findings.length) {
+    throw new Error(findings.join('\n\n'))
+  }
+  return {
+    checked,
+    young,
+    graceMin: Math.round(joinGraceMs / 60_000),
+    mintStore: DAEMON_MINT_DB,
+    ledger: DAEMON_LEDGER_DB,
+  }
 }
 
 export async function checkAgentReceiving() {
@@ -1455,7 +1607,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
+const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
 
 export async function checkResourceCleanup({
   previewReaper = reapIdlePreviews,
@@ -1529,6 +1681,7 @@ function defaultChecks() {
     ['spawn-wake-seat', checkSpawnWakeSeat],
     ['linked-remote-safety', checkLinkedRemoteSafety],
     ['agent-receiving', checkAgentReceiving],
+    ['misconfigured-agents', checkMisconfiguredAgents],
     ['server-imports', checkServerImportResolution],
     ['bot-heartbeats', checkBotHeartbeats],
     ['resource-cleanup', checkResourceCleanup],
@@ -1678,7 +1831,7 @@ async function sendFailureNudge(report) {
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
+    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; async agent join coherence; bot heartbeat outcomes; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
   ].join('\n')
   for (const target of targets) {
     await sendChat(target, message)
