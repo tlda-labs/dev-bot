@@ -9,6 +9,7 @@ process.env.TLDA_DEV_BOT_NO_START = '1'
 
 const {
   checkDocumentRenders,
+  checkFileMaterialization,
   checkMessageRoundTrip,
   checkMcpSurface,
   checkBotHeartbeats,
@@ -167,6 +168,72 @@ await expectRed(
     joinGraceMs: 5 * 60_000,
   }),
   /no `permission_grants` row/,
+)
+
+await expectRed(
+  '10 file materialization chip artifact readback',
+  async () => checkFileMaterialization({
+    fleetServer: 'http://fleet',
+    storeServer: 'http://store',
+    openConnection: async () => ({
+      request: async message => {
+        if (message.type === 'reserve-shell' || message.type === 'login' || message.type === 'mark-dead') return { ok: true }
+        if (message.type === 'chat') return { event_ids: [404] }
+        throw new Error(`setup failed: unexpected probe ${message.type}`)
+      },
+      close: () => {},
+    }),
+    uploadAttachment: async () => ({
+      type: 'file',
+      id: 0,
+      path: '/tmp/chip.md',
+      name: 'chip.md',
+      url: 'http://fleet/api/file?path=/uploads/chip.md',
+      size: 64,
+      mimeType: 'text/markdown',
+      sha256: 'hash',
+    }),
+    request: async message => {
+      if (message.type !== 'fleet-search') throw new Error(`setup failed: unexpected ${message.type}`)
+      return {
+        results: [{
+          source: 'fleet',
+          id: 404,
+          text: 'file-materialization probe DEV-BOT-FILE-MATERIALIZATION-red',
+          metadata: {
+            inline_attachments: [{ type: 'file', id: 0, name: 'chip.md', url: 'http://fleet/api/file?path=/uploads/chip.md' }],
+            recipient_refs: {
+              'fleet:dev': {
+                attachments: {
+                  0: { state: 'available', localPath: '/tmp/inbox-refs/chip.md' },
+                },
+              },
+            },
+          },
+        }],
+      }
+    },
+    requestJson: async (base, urlPath, options = {}) => {
+      if (urlPath === '/api/projects') return { status: 201, body: { ok: true } }
+      if (urlPath.endsWith('/source-authority')) return { status: 200, body: { currentRevision: null } }
+      if (urlPath.endsWith('/push')) return { status: 200, body: { ok: true } }
+      if (urlPath.endsWith('/parts')) return { status: 200, body: { ok: true, outputFile: 'parts/chip.html' } }
+      if (options.method === 'DELETE') return { status: 200, body: { ok: true } }
+      throw new Error(`setup failed: unexpected ${urlPath}`)
+    },
+    requestText: async (base, urlPath) => {
+      if (urlPath.startsWith('/api/file')) return '# Chip\n\nDEV-BOT-FILE-MATERIALIZATION-red\n'
+      if (urlPath.startsWith('/docs/')) return '<html><body>missing</body></html>'
+      throw new Error(`setup failed: unexpected ${urlPath}`)
+    },
+    uuid: (() => {
+      const values = ['red', 'redprojx', 'senderx', 'namexx']
+      return () => values.shift()
+    })(),
+    now: () => 1_000,
+    sleepMs: async () => {},
+  }),
+  /missing marker/,
 )
 
 const strayDir = await mkdtemp(path.join(tmpdir(), 'devbot-red-cleanup-'))

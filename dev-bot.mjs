@@ -10,7 +10,7 @@
 import fs from 'fs'
 import path from 'path'
 import os from 'os'
-import { randomUUID } from 'crypto'
+import { createHash, randomUUID } from 'crypto'
 import { DatabaseSync } from 'node:sqlite'
 import { execFileSync } from 'child_process'
 import { fileURLToPath } from 'url'
@@ -77,9 +77,12 @@ export const configSchema = defineConfig({
   resourceCleanupIntervalMs: { env: 'TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS', default: 60_000, description: 'Playwright cleanup cadence.', parse: configTypes.integer, validate: positive },
   worktreeCleanupIntervalMs: { env: 'TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS', default: 3_600_000, description: 'Worktree cleanup cadence.', parse: configTypes.integer, validate: positive },
   statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
-  loadReportFile: { env: 'TLDA_DEV_BOT_LOAD_REPORT_FILE', default: 'mini-load-report.md', description: 'Project-relative volatile Mini load report Markdown path.', parse: configTypes.string },
-  loadReportSamples: { env: 'TLDA_DEV_BOT_LOAD_REPORT_SAMPLES', default: 7, description: 'Number of local load samples captured for an on-demand Mini load report.', parse: configTypes.integer, validate: positive },
-  loadReportSampleIntervalMs: { env: 'TLDA_DEV_BOT_LOAD_REPORT_SAMPLE_INTERVAL_MS', default: 5_000, description: 'Delay between local load samples in the on-demand Mini load report.', parse: configTypes.integer, validate: positive },
+  loadReportProject: { env: 'TLDA_DEV_BOT_LOAD_REPORT_PROJECT', default: 'mini-load', description: 'Project name for the live Mini load OJS report.', parse: configTypes.string },
+  loadReportSourceFile: { env: 'TLDA_DEV_BOT_LOAD_REPORT_SOURCE_FILE', default: 'index.qmd', description: 'Main QMD file for the live Mini load OJS report.', parse: configTypes.string },
+  loadReportDataFile: { env: 'TLDA_DEV_BOT_LOAD_REPORT_DATA_FILE', default: 'mini-load.csv', description: 'CSV source file appended by the live Mini load OJS report publisher.', parse: configTypes.string },
+  loadReportEnabled: { env: 'TLDA_DEV_BOT_LOAD_REPORT_ENABLED', default: false, description: 'Whether the periodic Mini load CSV publisher starts with the dev bot.', parse: configTypes.boolean },
+  loadReportIntervalMs: { env: 'TLDA_DEV_BOT_LOAD_REPORT_INTERVAL_MS', default: 60_000, description: 'Cadence for appending one real Mini load report row.', parse: configTypes.integer, validate: positive },
+  loadReportRetainedSamples: { env: 'TLDA_DEV_BOT_LOAD_REPORT_RETAINED_SAMPLES', default: 120, description: 'Rolling newest-row bound for the Mini load CSV source file.', parse: configTypes.integer, validate: positive },
   agentSilenceWindowMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_WINDOW_MS', default: 7_200_000, description: 'How long an agent may hold a delivered message without producing anything before it is reported silent.', parse: configTypes.integer, validate: positive },
   agentSilenceLookbackMs: { env: 'TLDA_DEV_BOT_AGENT_SILENCE_LOOKBACK_MS', default: 86_400_000, description: 'How far back to look for the delivery that an agent is silent on.', parse: configTypes.integer, validate: positive },
   agentWatchIntervalMs: { env: 'TLDA_DEV_BOT_AGENT_WATCH_INTERVAL_MS', default: 300_000, description: 'Cadence for the agent silence check, which costs one whole-roster read.', parse: configTypes.integer, validate: positive },
@@ -103,7 +106,10 @@ const {
   assetPathOverride: ASSET_PATH_OVERRIDE, allowNondefault: ALLOW_NONDEFAULT, nudgeTo: NUDGE_TO_OVERRIDE,
   nudgeLabel: NUDGE_LABEL, nudgeOnSetup: NUDGE_ON_SETUP, nudgeDryRun: NUDGE_DRY_RUN,
   resourceCleanupIntervalMs: RESOURCE_CLEANUP_INTERVAL_MS, worktreeCleanupIntervalMs: WORKTREE_CLEANUP_INTERVAL_MS,
-  loadReportSamples: LOAD_REPORT_SAMPLES, loadReportSampleIntervalMs: LOAD_REPORT_SAMPLE_INTERVAL_MS,
+  loadReportProject: LOAD_REPORT_PROJECT, loadReportSourceFile: LOAD_REPORT_SOURCE_FILE,
+  loadReportDataFile: LOAD_REPORT_DATA_FILE, loadReportEnabled: LOAD_REPORT_ENABLED,
+  loadReportIntervalMs: LOAD_REPORT_INTERVAL_MS,
+  loadReportRetainedSamples: LOAD_REPORT_RETAINED_SAMPLES,
   agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, agentJoinGraceMs: AGENT_JOIN_GRACE_MS,
   rosterTimeoutMs: ROSTER_TIMEOUT_MS,
@@ -197,6 +203,9 @@ let resourceCleanupTimer = null
 let resourceCleanupInFlight = false
 let lastWorktreeCleanupAt = 0
 const statusSamples = []
+let miniLoadReportTimer = null
+let miniLoadReportInFlight = false
+let miniLoadReportBootstrapped = false
 
 class ProbeSetupError extends Error {
   constructor(message) {
@@ -335,6 +344,49 @@ async function fetchText(base, urlPath) {
   const text = await res.text()
   if (!res.ok) throw new Error(`GET ${urlPath} returned HTTP ${res.status}${text ? ` ${text.slice(0, 200)}` : ''}`)
   return text
+}
+
+function serverRelativePath(rawUrl, base) {
+  const url = new URL(rawUrl, base)
+  const baseUrl = new URL(base)
+  if (url.origin !== baseUrl.origin) {
+    throw new Error(`attachment URL ${rawUrl} is not on expected server ${baseUrl.origin}`)
+  }
+  return `${url.pathname}${url.search}`
+}
+
+function sha256(buf) {
+  return createHash('sha256').update(buf).digest('hex')
+}
+
+async function uploadMarkdownAttachment(fleetServer, filePath) {
+  const buf = fs.readFileSync(filePath)
+  const name = path.basename(filePath)
+  const res = await fetch(`${fleetServer}/api/upload`, {
+    method: 'POST',
+    headers: { 'x-filename': encodeURIComponent(name) },
+    body: buf,
+    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+  })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`upload ${name} returned HTTP ${res.status}${text ? ` ${text.slice(0, 200)}` : ''}`)
+  let body
+  try {
+    body = text ? JSON.parse(text) : {}
+  } catch (e) {
+    throw new Error(`upload ${name} returned invalid JSON: ${e.message}`)
+  }
+  if (!body.url) throw new Error(`upload ${name} returned no url`)
+  return {
+    type: 'file',
+    id: 0,
+    path: filePath,
+    name,
+    url: new URL(body.url, fleetServer).toString(),
+    size: buf.length,
+    mimeType: 'text/markdown',
+    sha256: sha256(buf),
+  }
 }
 
 function projectIsUsableSvg(project) {
@@ -502,6 +554,136 @@ export async function checkDocumentRenders({
       }
     }))
     if (cleanupFailures.length) console.error(`[dev-bot] document render probe cleanup failed: ${cleanupFailures.join('; ')}`)
+  }
+}
+
+export async function checkFileMaterialization({
+  fleetServer = FLEET_SERVER,
+  storeServer = STORE_SERVER,
+  request = sendRequest,
+  requestJson = fetchJsonMaybe,
+  requestText = fetchText,
+  openConnection = openProbeConnection,
+  uploadAttachment = uploadMarkdownAttachment,
+  uuid = randomUUID,
+  now = () => Date.now(),
+  sleepMs = sleep,
+} = {}) {
+  const token = `DEV-BOT-FILE-MATERIALIZATION-${uuid()}`
+  const project = `devbot-materialize-${uuid().slice(0, 8)}`
+  const senderId = `fleet:dev-probe-${uuid().slice(0, 8)}`
+  const senderName = `dev-probe-${uuid().slice(0, 6)}`
+  const tempDir = fs.mkdtempSync(path.join(CONFIG_DIR, `${BOT_KEY}.${CONFIG_NAME}.materialize-`))
+  const markdownPath = path.join(tempDir, 'chip.md')
+  const markdown = `# Devbot File Materialization\n\n${token}\n\nInline math $x^2$.\n`
+  let sender = null
+  let senderRegistered = false
+  try {
+    fs.writeFileSync(markdownPath, markdown)
+    await requestJson(storeServer, '/api/projects', {
+      method: 'POST',
+      body: { name: project, title: 'Devbot file materialization probe', mainFile: 'index.md', format: 'markdown' },
+    })
+    const authority = (await requestJson(storeServer, `/api/projects/${encodeURIComponent(project)}/source-authority`)).body
+    await requestJson(storeServer, `/api/projects/${encodeURIComponent(project)}/push`, {
+      method: 'POST',
+      body: {
+        files: [{ path: 'index.md', content: '# Devbot materialization target\n' }],
+        sourceManifest: ['index.md'],
+        expectedRevision: authority?.currentRevision ?? null,
+        editedBy: AGENT_ID,
+      },
+    })
+
+    const attachment = await uploadAttachment(fleetServer, markdownPath)
+    if (!attachment?.url) throw new Error('markdown attachment upload returned no URL')
+    sender = await openConnection()
+    const payload = {
+      agent_id: senderId,
+      name: senderName,
+      cwd: REPO_ROOT,
+      labels: ['dev-probe'],
+      metadata: { bot_probe: BOT_KEY, disposable: true, file_materialization_probe: true },
+    }
+    await sender.request({ ...payload, type: 'reserve-shell' })
+    await sender.request({ ...payload, type: 'login' })
+    senderRegistered = true
+    const sent = await sender.request({
+      type: 'chat',
+      from: senderId,
+      to: AGENT_ID,
+      message: `file-materialization probe ${token}\n\n{{att:0}}`,
+      inline_attachments: [attachment],
+      _tempId: token,
+    }, REQUEST_TIMEOUT_MS)
+    const ackEventIds = Array.isArray(sent?.event_ids) ? sent.event_ids.map(Number) : []
+    if (!ackEventIds.length) throw new Error('file materialization chat did not return an accepted event id')
+
+    const since = new Date(now() - 60_000).toISOString()
+    const deadline = now() + REQUEST_TIMEOUT_MS
+    let event = null
+    while (now() < deadline) {
+      const history = await request({
+        type: 'fleet-search',
+        query: '',
+        me: AGENT_ID,
+        agent: AGENT_ID,
+        historyOnly: true,
+        eventOnly: true,
+        eventType: 'chat',
+        since,
+        limit: 40,
+      }, REQUEST_TIMEOUT_MS)
+      const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
+      event = events.find(row => ackEventIds.includes(Number(row.id || row.event_id)) || String(row.text || row.message || '').includes(token))
+      const eventAttachment = event?.metadata?.inline_attachments?.[0]
+      if (event && eventAttachment?.url) break
+      await sleepMs(500)
+    }
+    if (!event) throw new Error('accepted file-chip chat did not arrive in dev bot chat history')
+    const eventAttachment = event.metadata?.inline_attachments?.[0]
+    if (!eventAttachment?.url) throw new Error('file-chip chat event has no attachment URL')
+    const ref = event.metadata?.recipient_refs?.[AGENT_ID]?.attachments?.['0']
+
+    const chipMarkdown = await requestText(fleetServer, serverRelativePath(eventAttachment.url, fleetServer))
+    if (!chipMarkdown.includes(token)) throw new Error('file-chip URL resolved but did not contain the probe marker')
+    const materialized = (await requestJson(storeServer, `/api/projects/${encodeURIComponent(project)}/parts`, {
+      method: 'POST',
+      body: {
+        markdown: chipMarkdown,
+        title: 'Devbot file materialization chip',
+        provenance: { source: 'dev-bot-file-materialization', eventId: event.id || event.event_id || null },
+      },
+    })).body
+    if (!materialized?.ok || !materialized.outputFile) {
+      throw new Error(`project part materialization failed: ${materialized?.error || 'no outputFile'}`)
+    }
+    const artifactPath = `/docs/${encodeURIComponent(project)}/${materialized.outputFile}`
+    const artifact = await requestText(storeServer, `${artifactPath}?t=${now()}`)
+    if (!/<html[\s>]/i.test(artifact.slice(0, 1000))) throw new Error(`materialized markdown artifact ${artifactPath} is not HTML`)
+    if (!artifact.includes(token)) throw new Error(`materialized markdown artifact ${artifactPath} is missing marker`)
+    return {
+      eventId: event.id || event.event_id || null,
+      project,
+      attachmentUrl: eventAttachment.url,
+      recipientMaterializationState: ref?.state || null,
+      recipientMaterializationError: ref?.error || null,
+      materializedPath: materialized.outputFile,
+      artifactPath,
+      bytes: artifact.length,
+    }
+  } finally {
+    if (senderRegistered) {
+      try {
+        await sender.request({ type: 'mark-dead', agent: senderId }, 5000)
+      } catch (e) {
+        console.error(`[dev-bot] disposable sender cleanup failed for ${senderId}: ${e.message}`)
+      }
+    }
+    sender?.close()
+    await requestJson(storeServer, `/api/projects/${encodeURIComponent(project)}`, { method: 'DELETE', okStatuses: [404] })
+      .catch(e => console.error(`[dev-bot] file materialization probe cleanup failed for ${project}: ${e.message}`))
+    fs.rmSync(tempDir, { recursive: true, force: true })
   }
 }
 
@@ -1612,7 +1794,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
+const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
 
 export async function checkResourceCleanup({
   previewReaper = reapIdlePreviews,
@@ -1687,6 +1869,7 @@ function defaultChecks() {
     ['linked-remote-safety', checkLinkedRemoteSafety],
     ['agent-receiving', checkAgentReceiving],
     ['misconfigured-agents', checkMisconfiguredAgents],
+    ['file-materialization', checkFileMaterialization],
     ['server-imports', checkServerImportResolution],
     ['bot-heartbeats', checkBotHeartbeats],
     ['resource-cleanup', checkResourceCleanup],
@@ -2016,136 +2199,260 @@ function loadState(latest, cores) {
   return 'The Mini is busy enough to show up in this window.'
 }
 
-export async function collectMiniLoadSamples({
-  count = LOAD_REPORT_SAMPLES,
-  intervalMs = LOAD_REPORT_SAMPLE_INTERVAL_MS,
+async function collectMiniLoadSample({
+  cpuWindowMs = 1000,
   loadavg = () => os.loadavg(),
   totalmem = () => os.totalmem(),
   freemem = () => os.freemem(),
   cpus = () => os.cpus(),
+  now = () => new Date(),
+  lag = () => measureEventLoopLagMs(),
+  wait = sleep,
+} = {}) {
+  const previousCpu = cpuTotals(cpus())
+  await wait(cpuWindowMs)
+  const currentCpu = cpuTotals(cpus())
+  const totalBytes = totalmem()
+  const freeBytes = freemem()
+  const usedBytes = Math.max(0, totalBytes - freeBytes)
+  const [load1, load5, load15] = loadavg()
+  return {
+    ts: now().toISOString(),
+    load1,
+    load5,
+    load15,
+    cpuBusyPercent: cpuBusyPercent(previousCpu, currentCpu),
+    memoryUsedBytes: usedBytes,
+    memoryTotalBytes: totalBytes,
+    memoryUsedPercent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0,
+    eventLoopLagMs: await lag(),
+  }
+}
+
+export async function collectMiniLoadSamples({
+  count = 1,
+  intervalMs = 0,
   hostname = () => os.hostname(),
   now = () => new Date(),
+  cores = () => os.cpus().length || 1,
   context = () => Promise.all([readFleetLoadContext(), Promise.resolve(readTmuxSessionCounts())]),
-  lag = () => measureEventLoopLagMs(),
+  sample = collectMiniLoadSample,
   wait = sleep,
 } = {}) {
   const startedAt = now().toISOString()
   const machine = hostname()
-  const cores = cpus().length || 1
+  const coreCount = cores()
   const [fleet, tmux] = await context()
   const samples = []
-  let previousCpu = cpuTotals(cpus())
   for (let index = 0; index < count; index++) {
     if (index > 0) await wait(intervalMs)
-    const currentCpu = cpuTotals(cpus())
-    const totalBytes = totalmem()
-    const freeBytes = freemem()
-    const usedBytes = Math.max(0, totalBytes - freeBytes)
-    const [load1, load5, load15] = loadavg()
-    samples.push({
-      ts: now().toISOString(),
-      load1,
-      load5,
-      load15,
-      cpuBusyPercent: cpuBusyPercent(previousCpu, currentCpu),
-      memoryUsedBytes: usedBytes,
-      memoryTotalBytes: totalBytes,
-      memoryUsedPercent: totalBytes > 0 ? usedBytes / totalBytes * 100 : 0,
-      eventLoopLagMs: await lag(),
-    })
-    previousCpu = currentCpu
+    samples.push(await sample())
   }
-  return { startedAt, generatedAt: now().toISOString(), machine, cores, fleet, tmux, samples }
+  return { startedAt, generatedAt: now().toISOString(), machine, cores: coreCount, fleet, tmux, samples }
 }
 
-function svgPoint({ sample, index, samples, width, height, maxY, value }) {
-  const x = samples.length <= 1 ? width / 2 : 38 + index * (width - 76) / (samples.length - 1)
-  const y = height - 28 - (Math.max(0, value) / maxY) * (height - 58)
-  return { x: x.toFixed(1), y: y.toFixed(1), sample }
+const MINI_LOAD_CSV_COLUMNS = [
+  'ts',
+  'machine',
+  'cores',
+  'load1',
+  'load5',
+  'load15',
+  'cpuBusyPercent',
+  'memoryUsedBytes',
+  'memoryTotalBytes',
+  'memoryUsedPercent',
+  'eventLoopLagMs',
+  'awakeAgents',
+  'botAgents',
+  'humanAgents',
+  'tmuxTotal',
+  'tmuxFleet',
+  'tmuxPlaywright',
+]
+
+function finiteOrBlank(value) {
+  const number = Number(value)
+  return Number.isFinite(number) ? number : ''
 }
 
-function renderSeries(points, key, color, label) {
-  const usable = points.filter(point => Number.isFinite(point.sample[key]))
-  if (!usable.length) return ''
-  const line = usable.map(point => `${point.x},${point.y}`).join(' ')
+function csvCell(value) {
+  if (value === null || value === undefined || value === '') return ''
+  const text = String(value)
+  return /[",\n\r]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text
+}
+
+function splitCsvLine(line) {
+  const cells = []
+  let cell = ''
+  let quoted = false
+  for (let index = 0; index < line.length; index++) {
+    const char = line[index]
+    if (quoted) {
+      if (char === '"' && line[index + 1] === '"') {
+        cell += '"'
+        index++
+      } else if (char === '"') {
+        quoted = false
+      } else {
+        cell += char
+      }
+    } else if (char === '"') {
+      quoted = true
+    } else if (char === ',') {
+      cells.push(cell)
+      cell = ''
+    } else {
+      cell += char
+    }
+  }
+  cells.push(cell)
+  return cells
+}
+
+export function parseMiniLoadCsv(csv = '') {
+  const lines = String(csv || '').split(/\r?\n/).filter(line => line.length)
+  if (!lines.length) return []
+  const headers = splitCsvLine(lines[0])
+  return lines.slice(1).map(line => {
+    const cells = splitCsvLine(line)
+    const row = {}
+    headers.forEach((header, index) => { row[header] = cells[index] ?? '' })
+    return row
+  }).filter(row => row.ts)
+}
+
+function miniLoadRowFromSample(report, sample) {
+  return {
+    ts: sample.ts,
+    machine: report.machine,
+    cores: report.cores,
+    load1: finiteOrBlank(sample.load1),
+    load5: finiteOrBlank(sample.load5),
+    load15: finiteOrBlank(sample.load15),
+    cpuBusyPercent: finiteOrBlank(sample.cpuBusyPercent),
+    memoryUsedBytes: finiteOrBlank(sample.memoryUsedBytes),
+    memoryTotalBytes: finiteOrBlank(sample.memoryTotalBytes),
+    memoryUsedPercent: finiteOrBlank(sample.memoryUsedPercent),
+    eventLoopLagMs: finiteOrBlank(sample.eventLoopLagMs),
+    awakeAgents: finiteOrBlank(report.fleet?.awakeAgents),
+    botAgents: finiteOrBlank(report.fleet?.botAgents),
+    humanAgents: finiteOrBlank(report.fleet?.humanAgents),
+    tmuxTotal: finiteOrBlank(report.tmux?.total),
+    tmuxFleet: finiteOrBlank(report.tmux?.fleet),
+    tmuxPlaywright: finiteOrBlank(report.tmux?.playwright),
+  }
+}
+
+export function renderMiniLoadCsv(rows = []) {
+  const body = rows.map(row => MINI_LOAD_CSV_COLUMNS.map(column => csvCell(row[column])).join(','))
+  return `${MINI_LOAD_CSV_COLUMNS.join(',')}\n${body.join('\n')}${body.length ? '\n' : ''}`
+}
+
+export function renderMiniLoadQmd({
+  dataFile = LOAD_REPORT_DATA_FILE,
+  retainedSamples = LOAD_REPORT_RETAINED_SAMPLES,
+} = {}) {
   return [
-    `<polyline fill="none" stroke="${color}" stroke-width="3" points="${line}"><title>${label}</title></polyline>`,
-    ...usable.map(point => `<circle cx="${point.x}" cy="${point.y}" r="4" fill="${color}"><title>${point.sample.ts}: ${label} ${formatPercent(point.sample[key])}</title></circle>`),
-  ].join('\n  ')
-}
-
-function renderMiniLoadChart(report) {
-  const samples = report.samples || []
-  const width = 760
-  const height = 260
-  const projected = samples.map(sample => ({
-    ...sample,
-    loadPerCorePercent: report.cores > 0 ? sample.load1 / report.cores * 100 : sample.load1 * 100,
-  }))
-  const maxY = Math.max(100, ...projected.flatMap(sample => [
-    sample.loadPerCorePercent,
-    Number.isFinite(sample.cpuBusyPercent) ? sample.cpuBusyPercent : 0,
-    sample.memoryUsedPercent,
-  ]))
-  const points = projected.map((sample, index) => svgPoint({ sample, index, samples: projected, width, height, maxY, value: sample.loadPerCorePercent }))
-  const cpuPoints = projected.map((sample, index) => svgPoint({ sample, index, samples: projected, width, height, maxY, value: sample.cpuBusyPercent || 0 }))
-  const memoryPoints = projected.map((sample, index) => svgPoint({ sample, index, samples: projected, width, height, maxY, value: sample.memoryUsedPercent }))
-  const y100 = height - 28 - (100 / maxY) * (height - 58)
-  return `<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="Mini load timeline" style="max-width:100%;background:#fafafa;border:1px solid #ddd">
-  <line x1="38" y1="${y100.toFixed(1)}" x2="${width - 38}" y2="${y100.toFixed(1)}" stroke="#bbb" stroke-dasharray="4 4"/>
-  <text x="42" y="${Math.max(14, y100 - 6).toFixed(1)}" font-size="12" fill="#555">100%</text>
-  ${renderSeries(points, 'loadPerCorePercent', '#2563eb', '1 min load per core')}
-  ${renderSeries(cpuPoints, 'cpuBusyPercent', '#dc2626', 'CPU busy')}
-  ${renderSeries(memoryPoints, 'memoryUsedPercent', '#16a34a', 'memory used')}
-  <g font-size="12" fill="#333">
-    <rect x="40" y="${height - 20}" width="10" height="10" fill="#2563eb"/><text x="55" y="${height - 11}">load/core</text>
-    <rect x="145" y="${height - 20}" width="10" height="10" fill="#dc2626"/><text x="160" y="${height - 11}">CPU</text>
-    <rect x="220" y="${height - 20}" width="10" height="10" fill="#16a34a"/><text x="235" y="${height - 11}">memory</text>
-  </g>
-</svg>`
-}
-
-export function renderMiniLoadMarkdown(report) {
-  const samples = report.samples || []
-  const latest = samples.at(-1)
-  const fleet = report.fleet || {}
-  const tmux = report.tmux || {}
-  return [
-    '# Mini load report {.volatile}',
+    '---',
+    'title: Mini load report',
+    'format:',
+    '  html:',
+    '    embed-resources: false',
+    'execute:',
+    '  echo: false',
+    '---',
     '',
-    loadState(latest, report.cores),
+    `The dev bot appends one real row to \`${dataFile}\` every ${Math.round(LOAD_REPORT_INTERVAL_MS / 1000)} seconds and keeps the newest ${retainedSamples} rows.`,
     '',
-    `Generated: ${report.generatedAt}`,
+    'Provenance: local `os.loadavg()`, `os.cpus()`, `os.totalmem()`, `os.freemem()`, one event-loop lag timer, `tmux list-sessions`, and the fleet `awake` roster.',
     '',
-    `Machine: ${report.machine || 'unknown'} (${report.cores || 'unknown'} CPU cores).`,
+    '```{ojs}',
+    `rows = FileAttachment("${dataFile}").csv({typed: true})`,
     '',
-    'Provenance: local `os.loadavg()`, `os.cpus()`, `os.totalmem()`, `os.freemem()`, one event-loop lag timer, `tmux list-sessions`, and the fleet `awake` roster. The inline SVG is used so the report remains ordinary draggable markdown without a separate build step.',
+    'latest = rows[rows.length - 1]',
+    'cores = latest?.cores || 1',
+    'fmtPct = (value) => Number.isFinite(value) ? `${value.toFixed(1)}%` : "n/a"',
+    'fmtBytes = (bytes) => {',
+    '  if (!Number.isFinite(bytes)) return "n/a"',
+    '  if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KiB`',
+    '  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`',
+    '  return `${(bytes / 1024 ** 3).toFixed(2)} GiB`',
+    '}',
+    'summaryText = {',
+    '  if (!latest) return "No completed load sample is available yet."',
+    '  const perCoreLoad = latest.load1 / cores',
+    '  const busy = Number.isFinite(latest.cpuBusyPercent) ? latest.cpuBusyPercent : 0',
+    '  const lag = Number.isFinite(latest.eventLoopLagMs) ? latest.eventLoopLagMs : 0',
+    '  if (perCoreLoad < 0.7 && busy < 70 && latest.memoryUsedPercent < 85) return "The Mini is running comfortably in this window."',
+    '  if (perCoreLoad < 1.2 && busy < 85 && lag < 50) return "The Mini is carrying load but staying responsive in this window."',
+    '  return "The Mini is busy enough to show up in this window."',
+    '}',
+    '',
+    'summary = html`<section class="mini-load-summary">',
+    '  <p><strong>${summaryText}</strong></p>',
+    '  <table>',
+    '    <tbody>',
+    '      <tr><th>Latest row</th><td>${latest?.ts || "n/a"}</td></tr>',
+    '      <tr><th>Machine</th><td>${latest?.machine || "unknown"} (${cores} CPU cores)</td></tr>',
+    '      <tr><th>1 min load</th><td>${latest ? latest.load1.toFixed(2) : "n/a"}</td></tr>',
+    '      <tr><th>CPU busy</th><td>${latest ? fmtPct(latest.cpuBusyPercent) : "n/a"}</td></tr>',
+    '      <tr><th>Memory used</th><td>${latest ? `${fmtBytes(latest.memoryUsedBytes)} / ${fmtBytes(latest.memoryTotalBytes)} (${fmtPct(latest.memoryUsedPercent)})` : "n/a"}</td></tr>',
+    '      <tr><th>Event-loop lag</th><td>${latest ? `${latest.eventLoopLagMs.toFixed(1)} ms` : "n/a"}</td></tr>',
+    '      <tr><th>Awake fleet agents</th><td>${latest?.awakeAgents ?? "n/a"}</td></tr>',
+    '      <tr><th>Tmux sessions</th><td>${latest ? `${latest.tmuxTotal} total, ${latest.tmuxFleet} fleet, ${latest.tmuxPlaywright} Playwright pool` : "n/a"}</td></tr>',
+    `      <tr><th>CSV bound</th><td>Newest ${retainedSamples} rows</td></tr>`,
+    '    </tbody>',
+    '  </table>',
+    '</section>`',
+    '',
+    'timelineRows = rows.flatMap((row) => {',
+    '  const ts = row.ts instanceof Date ? row.ts : new Date(row.ts)',
+    '  const rowCores = row.cores || 1',
+    '  return [',
+    '    { ts, metric: "load/core", value: row.load1 / rowCores * 100 },',
+    '    { ts, metric: "CPU", value: row.cpuBusyPercent },',
+    '    { ts, metric: "memory", value: row.memoryUsedPercent },',
+    '  ].filter((row) => Number.isFinite(row.value))',
+    '})',
+    '',
+    'timeline = Plot.plot({',
+    '  width: 760,',
+    '  height: 280,',
+    '  marginLeft: 48,',
+    '  y: { grid: true, label: "percent" },',
+    '  x: { label: null },',
+    '  color: { legend: true },',
+    '  marks: [',
+    '    Plot.ruleY([100], { stroke: "#999", strokeDasharray: "4,4" }),',
+    '    Plot.line(timelineRows, { x: "ts", y: "value", z: "metric", stroke: "metric" }),',
+    '    Plot.dot(timelineRows, { x: "ts", y: "value", z: "metric", stroke: "metric", fill: "metric", title: d => `${d.metric}: ${d.value.toFixed(1)}%` })',
+    '  ]',
+    '})',
+    '',
+    'sampleTable = Inputs.table(rows.map((row) => ({',
+    '  timestamp: row.ts,',
+    '  load1: row.load1?.toFixed?.(2),',
+    '  load5: row.load5?.toFixed?.(2),',
+    '  load15: row.load15?.toFixed?.(2),',
+    '  cpu: fmtPct(row.cpuBusyPercent),',
+    '  memory: fmtPct(row.memoryUsedPercent),',
+    '  eventLoopLagMs: row.eventLoopLagMs?.toFixed?.(1),',
+    '  awakeAgents: row.awakeAgents,',
+    '})))',
+    '```',
     '',
     '## Current snapshot',
     '',
-    '| Metric | Value |',
-    '|---|---:|',
-    `| 1 min load average | ${latest ? latest.load1.toFixed(2) : 'n/a'} |`,
-    `| 5 min load average | ${latest ? latest.load5.toFixed(2) : 'n/a'} |`,
-    `| 15 min load average | ${latest ? latest.load15.toFixed(2) : 'n/a'} |`,
-    `| CPU busy | ${latest ? formatPercent(latest.cpuBusyPercent) : 'n/a'} |`,
-    `| Memory used | ${latest ? `${formatBytes(latest.memoryUsedBytes)} / ${formatBytes(latest.memoryTotalBytes)} (${formatPercent(latest.memoryUsedPercent)})` : 'n/a'} |`,
-    `| Event-loop lag | ${latest ? `${latest.eventLoopLagMs.toFixed(1)} ms` : 'n/a'} |`,
-    `| Awake fleet agents | ${fleet.awakeAgents ?? 'n/a'} |`,
-    `| Awake bot agents | ${fleet.botAgents ?? 'n/a'} |`,
-    `| Tmux sessions | ${tmux.total ?? 'n/a'} total, ${tmux.fleet ?? 'n/a'} fleet, ${tmux.playwright ?? 'n/a'} Playwright pool |`,
+    '${summary}',
     '',
     '## Timeline',
     '',
-    renderMiniLoadChart(report),
+    '${timeline}',
     '',
     '## Samples',
     '',
-    '| Timestamp | Load 1m | Load 5m | Load 15m | CPU busy | Memory used | Event-loop lag |',
-    '|---|---:|---:|---:|---:|---:|---:|',
-    ...samples.map(sample => `| ${sample.ts} | ${sample.load1.toFixed(2)} | ${sample.load5.toFixed(2)} | ${sample.load15.toFixed(2)} | ${formatPercent(sample.cpuBusyPercent)} | ${formatPercent(sample.memoryUsedPercent)} | ${sample.eventLoopLagMs.toFixed(1)} ms |`),
-    ...(fleet.error ? ['', `Fleet roster note: ${fleet.error}`] : []),
-    ...(tmux.error ? ['', `Tmux note: ${tmux.error}`] : []),
+    '${sampleTable}',
   ].join('\n')
 }
 
@@ -2204,22 +2511,105 @@ export async function publishStatus({ transport = bot, samples = statusSamples }
   return `[Dev bot disk and worktree status](/docs/info/${encodeURIComponent(config.statusFile.replace(/\.md$/i, '.html'))})`
 }
 
+function miniLoadReportHref() {
+  const htmlFile = LOAD_REPORT_SOURCE_FILE.replace(/\.[^.]+$/i, '.html')
+  return `/docs/${encodeURIComponent(LOAD_REPORT_PROJECT)}/${encodeURIComponent(htmlFile)}`
+}
+
+async function readMiniLoadCsv({ storeServer = STORE_SERVER, requestText = fetchText } = {}) {
+  try {
+    return await requestText(storeServer, `/api/projects/${encodeURIComponent(LOAD_REPORT_PROJECT)}/source/${encodeURIComponent(LOAD_REPORT_DATA_FILE)}`)
+  } catch (e) {
+    if (/HTTP 404/.test(e.message)) return ''
+    throw e
+  }
+}
+
+async function ensureMiniLoadProject({ storeServer = STORE_SERVER, requestJson = fetchJsonMaybe } = {}) {
+  const existing = await requestJson(storeServer, `/api/projects/${encodeURIComponent(LOAD_REPORT_PROJECT)}`, { okStatuses: [404] })
+  if (existing.status === 404) {
+    await requestJson(storeServer, '/api/projects', {
+      method: 'POST',
+      body: {
+        name: LOAD_REPORT_PROJECT,
+        title: 'Mini load report',
+        mainFile: LOAD_REPORT_SOURCE_FILE,
+        format: 'qmd',
+      },
+    })
+    return
+  }
+  const project = existing.body || {}
+  if (project.format && project.format !== 'qmd') {
+    throw new Error(`project ${LOAD_REPORT_PROJECT} already exists with format ${project.format}, not qmd`)
+  }
+  if (project.mainFile && project.mainFile !== LOAD_REPORT_SOURCE_FILE) {
+    throw new Error(`project ${LOAD_REPORT_PROJECT} already uses main file ${project.mainFile}, not ${LOAD_REPORT_SOURCE_FILE}`)
+  }
+}
+
+async function pushMiniLoadProjectFiles(files, { storeServer = STORE_SERVER, requestJson = fetchJsonMaybe } = {}) {
+  const authority = (await requestJson(storeServer, `/api/projects/${encodeURIComponent(LOAD_REPORT_PROJECT)}/source-authority`)).body
+  const push = await requestJson(storeServer, `/api/projects/${encodeURIComponent(LOAD_REPORT_PROJECT)}/push`, {
+    method: 'POST',
+    body: {
+      files,
+      sourceManifest: [LOAD_REPORT_SOURCE_FILE, LOAD_REPORT_DATA_FILE],
+      expectedRevision: authority?.currentRevision ?? null,
+      editedBy: AGENT_ID,
+    },
+    okStatuses: [409],
+  })
+  if (push.status === 409) return { conflict: true, error: push.body?.error || 'source revision conflict' }
+  if (!push.body?.ok) throw new Error(push.body?.error || 'Mini load source push was not accepted')
+  return { ok: true, authority: push.body?.authority || null }
+}
+
 export async function publishMiniLoadReport({
-  transport = bot,
   report = null,
   collect = collectMiniLoadSamples,
+  storeServer = STORE_SERVER,
+  requestJson = fetchJsonMaybe,
+  requestText = fetchText,
+  bootstrap = !miniLoadReportBootstrapped,
+  retries = 2,
 } = {}) {
+  await ensureMiniLoadProject({ storeServer, requestJson })
   const current = report || await collect()
-  const requestId = `mini-load:${randomUUID()}`
-  const result = await transport.sendAndWait({
-    type: 'source-change',
-    project: 'info',
-    files: [{ path: config.loadReportFile, content: renderMiniLoadMarkdown(current) }],
-    editedBy: AGENT_ID,
-    requestId,
-  }, message => message.type === 'source-change-result' && message.requestId === requestId, REQUEST_TIMEOUT_MS)
-  if (!result.ok) throw new Error(result.error || `source update failed (${result.status || result.httpStatus})`)
-  return `[Mini load report](/docs/info/${encodeURIComponent(config.loadReportFile.replace(/\.md$/i, '.html'))})`
+  const newRows = (current.samples || []).map(sample => miniLoadRowFromSample(current, sample))
+
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const existingRows = parseMiniLoadCsv(await readMiniLoadCsv({ storeServer, requestText }))
+    const rows = [...existingRows, ...newRows].slice(-LOAD_REPORT_RETAINED_SAMPLES)
+    const files = [
+      ...(bootstrap || !miniLoadReportBootstrapped ? [{ path: LOAD_REPORT_SOURCE_FILE, content: renderMiniLoadQmd() }] : []),
+      { path: LOAD_REPORT_DATA_FILE, content: renderMiniLoadCsv(rows) },
+    ]
+    const result = await pushMiniLoadProjectFiles(files, { storeServer, requestJson })
+    if (!result.conflict) {
+      miniLoadReportBootstrapped = true
+      return `[Mini load report](${miniLoadReportHref()})`
+    }
+  }
+  throw new Error(`Mini load source push conflicted after ${retries + 1} attempts`)
+}
+
+async function refreshMiniLoadReport() {
+  if (miniLoadReportInFlight) return
+  miniLoadReportInFlight = true
+  try {
+    await publishMiniLoadReport({ bootstrap: !miniLoadReportBootstrapped })
+    writeHeartbeat('mini-load-report-published', {
+      project: LOAD_REPORT_PROJECT,
+      csvFile: LOAD_REPORT_DATA_FILE,
+      retainedSamples: LOAD_REPORT_RETAINED_SAMPLES,
+    })
+  } catch (e) {
+    writeHeartbeat('mini-load-report-failed', { error: e.message })
+    console.error('[dev-bot] Mini load report publish failed:', e.message)
+  } finally {
+    miniLoadReportInFlight = false
+  }
 }
 
 export const commands = [{
@@ -2233,10 +2623,10 @@ export const commands = [{
 }, {
   name: 'load',
   summary: 'Publish and return the current Mini load report.',
-  help: 'Samples local CPU, load average, memory, event-loop lag, fleet agents, and tmux sessions into a semantic Markdown report with an inline timeline chart.',
+  help: 'Appends one real Mini load row to the mini-load CSV source file, refreshes the QMD report source when needed, and returns the rendered project link.',
   examples: ['load'],
   handler: async ({ reply }) => {
-    await reply(await publishMiniLoadReport())
+    await reply(await publishMiniLoadReport({ bootstrap: true }))
   },
 }]
 
@@ -2255,7 +2645,13 @@ if (process.env.TLDA_DEV_BOT_NO_START !== '1') {
   }).onOpen(() => {
     writeHeartbeat('ws-open')
     if (sweepTimer) clearInterval(sweepTimer)
+    if (miniLoadReportTimer) clearInterval(miniLoadReportTimer)
     sweepTimer = setInterval(() => sweep().catch(e => console.error('[dev-bot] sweep failed:', e.message)), INTERVAL_MS)
+    if (LOAD_REPORT_ENABLED) {
+      miniLoadReportTimer = setInterval(() => refreshMiniLoadReport(), LOAD_REPORT_INTERVAL_MS)
+      miniLoadReportTimer.unref?.()
+      refreshMiniLoadReport()
+    }
     sweep().catch(e => console.error('[dev-bot] initial sweep failed:', e.message))
     cleanupResources().catch(e => console.error('[dev-bot] initial resource cleanup failed:', e.message))
   }).onMessage(msg => {

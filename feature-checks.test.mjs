@@ -8,6 +8,7 @@ process.env.TLDA_DEV_BOT_NO_START = '1'
 const {
   checkMessageRoundTrip,
   checkDocumentRenders,
+  checkFileMaterialization,
   checkMcpSurface,
   checkBotHeartbeats,
   checkMisconfiguredAgents,
@@ -49,6 +50,70 @@ function fakeRenderSurface({ artifact = '<html><body>DEV-BOT-RENDER-MARKDOWN-MAR
       calls.push({ kind: 'text', urlPath })
       if (urlPath.includes('page-info.json')) return JSON.stringify([{ file: 'index.html', width: 800, height: 1000 }])
       return artifact
+    },
+  }
+}
+
+function fakeMaterializationSurface({ artifact = '<html><body>DEV-BOT-FILE-MATERIALIZATION-marker</body></html>', refState = 'available' } = {}) {
+  const calls = []
+  const eventId = 314
+  const attachmentUrl = 'http://fleet/api/file?path=/uploads/chip.md'
+  return {
+    calls,
+    openConnection: async () => ({
+      request: async message => {
+        calls.push({ kind: 'probe', message })
+        if (message.type === 'reserve-shell' || message.type === 'login' || message.type === 'mark-dead') return { ok: true }
+        if (message.type === 'chat') return { event_ids: [eventId] }
+        throw new Error(`unexpected probe ${message.type}`)
+      },
+      close: () => calls.push({ kind: 'close' }),
+    }),
+    uploadAttachment: async () => ({
+      type: 'file',
+      id: 0,
+      path: '/tmp/chip.md',
+      name: 'chip.md',
+      url: attachmentUrl,
+      size: 64,
+      mimeType: 'text/markdown',
+      sha256: 'hash',
+    }),
+    request: async message => {
+      calls.push({ kind: 'request', message })
+      if (message.type !== 'fleet-search') throw new Error(`unexpected request ${message.type}`)
+      return {
+        results: [{
+          source: 'fleet',
+          id: eventId,
+          text: 'file-materialization probe DEV-BOT-FILE-MATERIALIZATION-marker\n\n{{att:0}}',
+          metadata: {
+            inline_attachments: [{ type: 'file', id: 0, name: 'chip.md', url: attachmentUrl }],
+            recipient_refs: {
+              'fleet:dev': {
+                attachments: {
+                  0: { state: refState, localPath: '/tmp/inbox-refs/chip.md' },
+                },
+              },
+            },
+          },
+        }],
+      }
+    },
+    requestJson: async (base, urlPath, options = {}) => {
+      calls.push({ kind: 'json', urlPath, options })
+      if (urlPath === '/api/projects') return { status: 201, body: { ok: true } }
+      if (urlPath.endsWith('/source-authority')) return { status: 200, body: { currentRevision: null } }
+      if (urlPath.endsWith('/push')) return { status: 200, body: { ok: true } }
+      if (urlPath.endsWith('/parts')) return { status: 200, body: { ok: true, outputFile: 'parts/chip.html' } }
+      if (options.method === 'DELETE') return { status: 200, body: { ok: true } }
+      throw new Error(`unexpected json ${urlPath}`)
+    },
+    requestText: async (base, urlPath) => {
+      calls.push({ kind: 'text', urlPath })
+      if (urlPath.startsWith('/api/file')) return '# Chip\n\nDEV-BOT-FILE-MATERIALIZATION-marker\n'
+      if (urlPath.startsWith('/docs/')) return artifact
+      throw new Error(`unexpected text ${urlPath}`)
     },
   }
 }
@@ -196,6 +261,43 @@ test('document render probe blocks the LaTeX leg when no watched SVG probe exist
   })
   assert.equal(result.blocked, true)
   assert.match(result.reason, /daemon-watched source project/)
+})
+
+test('file materialization probe resolves chat chip and rendered markdown artifact', async () => {
+  const surface = fakeMaterializationSurface()
+  const result = await checkFileMaterialization({
+    fleetServer: 'http://fleet',
+    storeServer: 'http://store',
+    ...surface,
+    uuid: (() => {
+      const values = ['marker', 'projxxxx', 'senderxx', 'namexx']
+      return () => values.shift()
+    })(),
+    now: () => 1_000,
+    sleepMs: async () => {},
+  })
+
+  assert.equal(result.eventId, 314)
+  assert.equal(result.materializedPath, 'parts/chip.html')
+  assert.equal(surface.calls.some(call => call.kind === 'text' && call.urlPath.startsWith('/api/file')), true)
+  assert.equal(surface.calls.some(call => call.kind === 'text' && call.urlPath.includes('/docs/devbot-materialize-projxxxx/parts/chip.html')), true)
+})
+
+test('file materialization probe goes red when rendered artifact drops marker', async () => {
+  await assert.rejects(
+    checkFileMaterialization({
+      fleetServer: 'http://fleet',
+      storeServer: 'http://store',
+      ...fakeMaterializationSurface({ artifact: '<html><body>empty</body></html>' }),
+      uuid: (() => {
+        const values = ['marker', 'projxxxx', 'senderxx', 'namexx']
+        return () => values.shift()
+      })(),
+      now: () => 1_000,
+      sleepMs: async () => {},
+    }),
+    /missing marker/,
+  )
 })
 
 test('MCP surface reads durable surfaces and rejects model=bot', async () => {

@@ -3,7 +3,15 @@ import { spawnSync } from 'node:child_process'
 import test from 'node:test'
 
 process.env.TLDA_DEV_BOT_NO_START = '1'
-const { configSchema, publishMiniLoadReport, publishStatus, renderMiniLoadMarkdown, renderStatusMarkdown } = await import('./dev-bot.mjs')
+const {
+  configSchema,
+  parseMiniLoadCsv,
+  publishMiniLoadReport,
+  publishStatus,
+  renderMiniLoadCsv,
+  renderMiniLoadQmd,
+  renderStatusMarkdown,
+} = await import('./dev-bot.mjs')
 
 test('linked remote safety probe is explicit opt-in', () => {
   assert.equal(configSchema.fields.linkedRemoteEnabled.default, false)
@@ -12,6 +20,11 @@ test('linked remote safety probe is explicit opt-in', () => {
   assert.equal(configSchema.fields.linkedRemoteUrl.env, 'TLDA_DEV_BOT_LINKED_REMOTE_URL')
   assert.equal(configSchema.fields.linkedRemoteTokenFile.default, '')
   assert.equal(configSchema.fields.linkedRemoteTokenFile.env, 'TLDA_DEV_BOT_LINKED_REMOTE_TOKEN_FILE')
+})
+
+test('Mini load periodic publisher is explicit opt-in', () => {
+  assert.equal(configSchema.fields.loadReportEnabled.default, false)
+  assert.equal(configSchema.fields.loadReportEnabled.env, 'TLDA_DEV_BOT_LOAD_REPORT_ENABLED')
 })
 
 test('status Markdown is semantic, labeled, timestamped, provenance-bearing, and interactive', () => {
@@ -53,8 +66,43 @@ test('status publication uses the info project source pipeline and exposes failu
   )
 })
 
-test('Mini load Markdown is semantic, reassuring, timestamped, provenance-bearing, and charted', () => {
-  const report = renderMiniLoadMarkdown({
+test('Mini load CSV is real-row shaped, escaped, and parseable', () => {
+  const csv = renderMiniLoadCsv([{
+    ts: '2026-08-10T03:00:00.000Z',
+    machine: 'mini',
+    cores: 10,
+    load1: 2.4,
+    load5: 2.8,
+    load15: 3.1,
+    cpuBusyPercent: 18.5,
+    memoryUsedBytes: 8589934592,
+    memoryTotalBytes: 25769803776,
+    memoryUsedPercent: 33.3,
+    eventLoopLagMs: 4.2,
+    awakeAgents: 12,
+    botAgents: 3,
+    humanAgents: 1,
+    tmuxTotal: 14,
+    tmuxFleet: 9,
+    tmuxPlaywright: 2,
+  }])
+  assert.match(csv, /^ts,machine,cores,load1,load5,load15,cpuBusyPercent,memoryUsedBytes,memoryTotalBytes,memoryUsedPercent,eventLoopLagMs,awakeAgents,botAgents,humanAgents,tmuxTotal,tmuxFleet,tmuxPlaywright\n/)
+  assert.equal(parseMiniLoadCsv(csv).at(-1).machine, 'mini')
+  assert.equal(parseMiniLoadCsv(csv).at(-1).load1, '2.4')
+})
+
+test('Mini load QMD reads the CSV with OJS and presents reassurance from real rows', () => {
+  const qmd = renderMiniLoadQmd({ dataFile: 'mini-load.csv', retainedSamples: 120 })
+  assert.match(qmd, /^---\ntitle: Mini load report/)
+  assert.match(qmd, /FileAttachment\("mini-load\.csv"\)\.csv\(\{typed: true\}\)/)
+  assert.match(qmd, /The Mini is running comfortably in this window/)
+  assert.match(qmd, /Newest 120 rows/)
+  assert.match(qmd, /Plot\.plot/)
+  assert.doesNotMatch(qmd, /fetch\(|Generators\.observe|<svg/)
+})
+
+test('Mini load publication creates the qmd project, appends CSV rows, bounds them, and exposes failure', async () => {
+  const report = {
     generatedAt: '2026-08-10T03:00:30.000Z',
     machine: 'mini',
     cores: 10,
@@ -71,39 +119,55 @@ test('Mini load Markdown is semantic, reassuring, timestamped, provenance-bearin
       memoryUsedPercent: 33.3,
       eventLoopLagMs: 4.2,
     }],
-  })
-  assert.match(report, /^# Mini load report \{\.volatile\}/)
-  assert.match(report, /The Mini is running comfortably/)
-  assert.match(report, /Provenance:/)
-  assert.match(report, /\| Awake fleet agents \| 12 \|/)
-  assert.match(report, /\| Tmux sessions \| 14 total, 9 fleet, 2 Playwright pool \|/)
-  assert.match(report, /<svg[\s\S]*Mini load timeline/)
-})
-
-test('Mini load publication uses the info project source pipeline and exposes failure', async () => {
-  let request
-  const transport = {
-    sendAndWait: async message => {
-      request = message
-      return { ok: true }
-    },
   }
-  const report = {
-    generatedAt: '2026-08-10T03:00:30.000Z',
+  const calls = []
+  const pushed = []
+  const existingCsv = renderMiniLoadCsv(Array.from({ length: 120 }, (_, index) => ({
+    ts: `2026-08-10T02:${String(index).padStart(2, '0')}:00.000Z`,
     machine: 'mini',
     cores: 10,
-    fleet: { awakeAgents: 12, botAgents: 3, humanAgents: 1 },
-    tmux: { total: 14, fleet: 9, playwright: 2 },
-    samples: [],
+    load1: index,
+  })))
+  const requestJson = async (_base, urlPath, options = {}) => {
+    calls.push({ urlPath, options })
+    if (urlPath === '/api/projects/mini-load' && options.method !== 'POST') return { status: 404, body: {} }
+    if (urlPath === '/api/projects') return { status: 200, body: { ok: true } }
+    if (urlPath.endsWith('/source-authority')) return { status: 200, body: { currentRevision: 'rev-1' } }
+    if (urlPath.endsWith('/push')) {
+      pushed.push(options.body)
+      return { status: 200, body: { ok: true, authority: { currentRevision: 'rev-2' } } }
+    }
+    throw new Error(`unexpected ${urlPath}`)
   }
-  assert.match(await publishMiniLoadReport({ transport, report }), /^\[Mini load report\]\(\/docs\/info\//)
-  assert.equal(request.type, 'source-change')
-  assert.equal(request.project, 'info')
-  assert.equal(request.files[0].path, 'mini-load-report.md')
-  assert.match(request.files[0].content, /^# Mini load report \{\.volatile\}/)
+  const requestText = async () => existingCsv
+
+  assert.match(await publishMiniLoadReport({ report, requestJson, requestText, bootstrap: true }), /^\[Mini load report\]\(\/docs\/mini-load\/index\.html\)$/)
+  assert.deepEqual(calls.find(call => call.urlPath === '/api/projects').options.body, {
+    name: 'mini-load',
+    title: 'Mini load report',
+    mainFile: 'index.qmd',
+    format: 'qmd',
+  })
+  assert.deepEqual(pushed[0].sourceManifest, ['index.qmd', 'mini-load.csv'])
+  assert.deepEqual(pushed[0].files.map(file => file.path), ['index.qmd', 'mini-load.csv'])
+  assert.match(pushed[0].files.find(file => file.path === 'index.qmd').content, /FileAttachment\("mini-load\.csv"\)\.csv/)
+  const rows = parseMiniLoadCsv(pushed[0].files.find(file => file.path === 'mini-load.csv').content)
+  assert.equal(rows.length, 120)
+  assert.equal(rows[0].ts, '2026-08-10T02:01:00.000Z')
+  assert.equal(rows.at(-1).ts, '2026-08-10T03:00:00.000Z')
+  assert.equal(rows.at(-1).awakeAgents, '12')
 
   await assert.rejects(
-    publishMiniLoadReport({ transport: { sendAndWait: async () => ({ ok: false, error: 'refused' }) }, report }),
+    publishMiniLoadReport({
+      report,
+      requestText: async () => '',
+      requestJson: async (_base, urlPath, options = {}) => {
+        if (urlPath === '/api/projects/mini-load' && options.method !== 'POST') return { status: 200, body: { format: 'qmd', mainFile: 'index.qmd' } }
+        if (urlPath.endsWith('/source-authority')) return { status: 200, body: { currentRevision: null } }
+        if (urlPath.endsWith('/push')) return { status: 200, body: { ok: false, error: 'refused' } }
+        throw new Error(`unexpected ${urlPath}`)
+      },
+    }),
     /refused/,
   )
 })
