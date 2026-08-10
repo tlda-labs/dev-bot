@@ -1298,6 +1298,32 @@ async function fleetTableRows(filter) {
   return Array.isArray(data?.agents) ? data.agents : []
 }
 
+async function lookupAgentsByIds(ids) {
+  const unique = [...new Set((ids || []).filter(Boolean).map(String))]
+  if (!unique.length) return []
+  const agents = []
+  for (let i = 0; i < unique.length; i += 200) {
+    const batch = unique.slice(i, i + 200)
+    let res
+    try {
+      res = await fetch(`${FLEET_SERVER}/api/agents/lookup?ids=${encodeURIComponent(batch.join(','))}`, {
+        signal: AbortSignal.timeout(ROSTER_TIMEOUT_MS),
+      })
+    } catch (e) {
+      throw new ProbeSetupError(`agents lookup did not answer: ${e.message}`)
+    }
+    if (!res.ok) throw new ProbeSetupError(`agents lookup returned HTTP ${res.status}`)
+    let data
+    try {
+      data = await res.json()
+    } catch (e) {
+      throw new ProbeSetupError(`agents lookup returned invalid JSON: ${e.message}`)
+    }
+    if (Array.isArray(data?.agents)) agents.push(...data.agents)
+  }
+  return agents
+}
+
 async function botSenderIds() {
   const rows = await fleetTableRows('bot')
   return new Set(rows.map(row => row.id).filter(Boolean))
@@ -1454,12 +1480,14 @@ function formatJoinFinding(row, reasons, ageMin) {
 export async function checkMisconfiguredAgents({
   mintRows = readDaemonMintRows(),
   grantRows = readDaemonGrantRows(),
+  agentRowsByIds = lookupAgentsByIds,
   now = () => Date.now(),
   joinGraceMs = AGENT_JOIN_GRACE_MS,
   sessionExists = tmuxSessionExists,
 } = {}) {
   const currentTime = now()
   const grants = new Map(grantRows.filter(row => row?.id).map(row => [row.id, row]))
+  const candidateFindings = []
   const findings = []
   let checked = 0
   let young = 0
@@ -1467,13 +1495,13 @@ export async function checkMisconfiguredAgents({
     const processState = readJsonObject(row.process_state, `mint ${row.mint_id} process_state`)
     const grant = row.fleet_id ? grants.get(row.fleet_id) || null : null
     if (!mintBelongsToConfig(row, processState, grant)) continue
-    checked += 1
 
     const createdAt = Date.parse(row.created_at || '')
     if (!Number.isFinite(createdAt)) {
       throw new ProbeSetupError(`mint ${row.mint_id} has unreadable created_at ${JSON.stringify(row.created_at)}`)
     }
     if (currentTime - createdAt < joinGraceMs) {
+      checked += 1
       young += 1
       continue
     }
@@ -1503,7 +1531,22 @@ export async function checkMisconfiguredAgents({
     if (grant?.daemon_key && processState?.daemon_key && grant.daemon_key !== processState.daemon_key) {
       reasons.push(`permission_grants daemon_key \`${grant.daemon_key}\` disagrees with process_state daemon_key \`${processState.daemon_key}\``)
     }
-    if (reasons.length) findings.push(formatJoinFinding(row, reasons, ageMin))
+    if (reasons.length) {
+      candidateFindings.push({ row, reasons, ageMin })
+    } else {
+      checked += 1
+    }
+  }
+
+  const candidateFleetIds = candidateFindings.map(({ row }) => row.fleet_id).filter(Boolean)
+  const agentRows = candidateFleetIds.length ? await agentRowsByIds(candidateFleetIds) : []
+  const agentsById = new Map(agentRows.filter(agent => agent?.id).map(agent => [agent.id, agent]))
+  for (const candidate of candidateFindings) {
+    const { row, reasons, ageMin } = candidate
+    const agent = row.fleet_id ? agentsById.get(row.fleet_id) || null : null
+    if (agent?.dead === true || agent?.dead === 1) continue
+    checked += 1
+    findings.push(formatJoinFinding(row, reasons, ageMin))
   }
 
   if (findings.length) {
@@ -1977,39 +2020,70 @@ function normalizeFailureReason(text) {
     .trim()
 }
 
-function keyPartsForFailure(name, error) {
+function failureSubjectKey(line) {
+  const text = String(line || '')
+  const fleetId = text.match(/`(fleet:[^`]+)`/)
+  if (fleetId) return fleetId[1]
+  const bold = text.match(/\*\*([^*]+)\*\*/)
+  if (bold) return normalizeFailureReason(bold[1])
+  return normalizeFailureReason(text)
+}
+
+function splitFailureSubjectBlocks(error) {
+  const blocks = []
+  let current = null
+  for (const line of String(error || '').split('\n').map(line => line.trim()).filter(Boolean)) {
+    if (!current || (line.startsWith('**') && !line.startsWith('**no '))) {
+      current = [line]
+      blocks.push(current)
+    } else {
+      current.push(line)
+    }
+  }
+  return blocks.length ? blocks.map(lines => lines.join('\n')) : ['']
+}
+
+function keyForFailureSubject(name, error) {
   const lines = String(error || '').split('\n').map(line => line.trim()).filter(Boolean)
+  const subject = failureSubjectKey(lines[0] || '')
   const reasons = lines
     .filter(line => line.startsWith('- '))
     .map(line => normalizeFailureReason(line.slice(2)))
   const stableReasons = reasons.length ? [...new Set(reasons)].sort() : [normalizeFailureReason(lines[0] || '')]
-  return `${name}:${stableReasons.join('|')}`
+  return `${name}:${subject}:${stableReasons.join('|')}`
 }
 
-function keyPartsFromSummary(summary) {
-  const parts = []
+function failureSectionsForCheck(name, error) {
+  return splitFailureSubjectBlocks(error).map(block => ({
+    key: keyForFailureSubject(name, block),
+    text: `${name}: ${block}`,
+  }))
+}
+
+function failureSectionsFromSummary(summary) {
+  const sections = []
   let current = null
   for (const line of String(summary || '').split('\n')) {
     const match = line.match(/^([a-z][a-z0-9-]*):\s*(.*)$/)
     if (match) {
-      if (current) parts.push(keyPartsForFailure(current.name, current.lines.join('\n')))
+      if (current) sections.push(...failureSectionsForCheck(current.name, current.lines.join('\n')))
       current = { name: match[1], lines: [match[2]] }
     } else if (current) {
       current.lines.push(line)
     }
   }
-  if (current) parts.push(keyPartsForFailure(current.name, current.lines.join('\n')))
-  return parts
+  if (current) sections.push(...failureSectionsForCheck(current.name, current.lines.join('\n')))
+  return sections
 }
 
 export function failureKey(reportOrSummary) {
   if (reportOrSummary && typeof reportOrSummary === 'object' && Array.isArray(reportOrSummary.results)) {
     const parts = reportOrSummary.results
       .filter(result => !result.ok)
-      .map(result => keyPartsForFailure(result.name, result.error))
+      .flatMap(result => failureSectionsForCheck(result.name, result.error).map(section => section.key))
     return parts.sort().join('\n')
   }
-  return keyPartsFromSummary(reportOrSummary).sort().join('\n')
+  return failureSectionsFromSummary(reportOrSummary).map(section => section.key).sort().join('\n')
 }
 
 function firstFailureLine(summary) {
@@ -2040,6 +2114,20 @@ export function composeFailureNudgeMessage({ report, unchanged, standingFor, fir
   return message
 }
 
+export function failureNudgeMessageReport({ report, activeKey }) {
+  if (!activeKey) return report
+  const activeKeys = new Set(String(activeKey).split('\n').filter(Boolean))
+  const sections = failureSectionsFromSummary(report.summary)
+  const standingSections = sections.filter(section => activeKeys.has(section.key))
+  const newSections = sections.filter(section => !activeKeys.has(section.key))
+  if (!newSections.length) return report
+  const summary = [
+    ...standingSections.map(section => `Still failing: ${section.text.split('\n')[0]}`),
+    ...newSections.map(section => section.text),
+  ].join('\n')
+  return { ...report, summary }
+}
+
 async function sendFailureNudge(report) {
   if (report.setupOnly && !NUDGE_ON_SETUP) {
     writeHeartbeat('probe-setup-suppressed', { summary: report.summary })
@@ -2053,8 +2141,11 @@ async function sendFailureNudge(report) {
   // A genuinely new finding still changes the key: a different check, or the
   // same check failing for a different normalized reason, interrupts immediately.
   const key = failureKey(report)
+  const sections = failureSectionsFromSummary(report.summary)
+  const activeKeys = new Set(activeFailure?.key ? activeFailure.key.split('\n').filter(Boolean) : [])
+  const newSections = activeFailure ? sections.filter(section => !activeKeys.has(section.key)) : sections
   const now = Date.now()
-  const unchanged = activeFailure?.key === key
+  const unchanged = Boolean(activeFailure && (activeFailure.key === key || newSections.length === 0))
   if (unchanged) {
     const wait = FAILURE_REPEAT_SCHEDULE_MS[Math.min(activeFailure.repeats, FAILURE_REPEAT_SCHEDULE_MS.length - 1)]
     if (now - activeFailure.lastNudgeAt < Math.max(wait, FAILURE_COOLDOWN_MS)) return
@@ -2069,8 +2160,11 @@ async function sendFailureNudge(report) {
     return
   }
   const standingFor = unchanged ? Math.round((now - activeFailure.firstAt) / 60_000) : 0
+  const messageReport = unchanged
+    ? report
+    : failureNudgeMessageReport({ report, activeKey: activeFailure?.key || '' })
   const message = composeFailureNudgeMessage({
-    report,
+    report: messageReport,
     unchanged,
     standingFor,
     firstAt: unchanged ? activeFailure.firstAt : now,
@@ -2080,8 +2174,8 @@ async function sendFailureNudge(report) {
     await sendChat(target, message)
   }
   activeFailure = unchanged
-    ? { ...activeFailure, lastNudgeAt: now, repeats: activeFailure.repeats + 1 }
-    : { key, firstAt: now, lastNudgeAt: now, repeats: 0, summary: report.summary }
+    ? { ...activeFailure, key, lastNudgeAt: now, repeats: activeFailure.repeats + 1, summary: report.summary }
+    : { key, firstAt: activeFailure?.firstAt || now, lastNudgeAt: now, repeats: 0, summary: report.summary }
   writeHeartbeat('failure-nudged', { targets, summary: report.summary, repeats: activeFailure.repeats, standingForMin: standingFor })
 }
 

@@ -13,6 +13,7 @@ const {
   checkBotHeartbeats,
   composeFailureNudgeMessage,
   failureKey,
+  failureNudgeMessageReport,
   checkMisconfiguredAgents,
   checkResourceCleanup,
   runChecks,
@@ -196,51 +197,105 @@ test('new failure notice keeps the full finding payload', () => {
   assert.match(message, /this line is part of the full payload/)
 })
 
-test('failure key ignores enumerated agent churn but keeps check and reason changes', () => {
+test('failure key keeps check subject while ignoring elapsed time', () => {
   const first = {
     results: [{
-      name: 'misconfigured-agents',
+      name: 'agent-receiving',
       ok: false,
       error: [
-        '**permission-missing-grant-proof** (`fleet:ab36e325`) has incoherent mint/daemon join state after 22979 minutes.',
-        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
-        '',
-        '**permission-profile-proof** (`fleet:37723d98`) has incoherent mint/daemon join state after 22979 minutes.',
-        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+        '**task-notify-and-timers** (`fleet:67508f59`) has produced nothing for 120 minutes.',
+        '- holding a message from `fleet:9ef0239d` delivered 2026-08-10T03:48:39.862Z',
+        '- last produced: nothing on record',
+        '- last call from its own client: 2026-08-10T00:53:43.376Z (hibernating)',
+        '- daemon last saw the process 2207s ago',
+        '- **no `permission_grants` row for this daemon -- it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.**',
       ].join('\n'),
     }],
   }
-  const churned = {
+  const later = {
     results: [{
-      name: 'misconfigured-agents',
+      name: 'agent-receiving',
       ok: false,
       error: [
-        '**different-agent** (`fleet:99999999`) has incoherent mint/daemon join state after 1 minutes.',
-        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+        '**task-notify-and-timers** (`fleet:67508f59`) has produced nothing for 133 minutes.',
+        '- holding a message from `fleet:9ef0239d` delivered 2026-08-10T03:48:39.862Z',
+        '- last produced: nothing on record',
+        '- last call from its own client: 2026-08-10T00:53:43.376Z (hibernating)',
+        '- daemon last saw the process 2967s ago',
+        '- **no `permission_grants` row for this daemon -- it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.**',
+      ].join('\n'),
+    }],
+  }
+  const differentSubject = {
+    results: [{
+      name: 'agent-receiving',
+      ok: false,
+      error: [
+        '**other-task-agent** (`fleet:99999999`) has produced nothing for 133 minutes.',
+        '- holding a message from `fleet:9ef0239d` delivered 2026-08-10T03:48:39.862Z',
+        '- last produced: nothing on record',
+        '- last call from its own client: 2026-08-10T00:53:43.376Z (hibernating)',
+        '- daemon last saw the process 2967s ago',
+        '- **no `permission_grants` row for this daemon -- it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.**',
       ].join('\n'),
     }],
   }
   const differentReason = {
     results: [{
-      name: 'misconfigured-agents',
+      name: 'agent-receiving',
       ok: false,
       error: [
-        '**different-agent** (`fleet:99999999`) has incoherent mint/daemon join state after 1 minutes.',
-        '- process_state exists for `fleet-different-agent`, but no session_id ever joined; the tmux session is gone',
+        '**task-notify-and-timers** (`fleet:67508f59`) has produced nothing for 133 minutes.',
+        '- last produced: a stale event',
       ].join('\n'),
     }],
   }
-  const differentCheck = {
-    results: [{
-      name: 'bot-heartbeats',
-      ok: false,
-      error: '**todd** is declared for `testing` and has not written a heartbeat for 73 minutes.',
-    }],
-  }
 
-  assert.equal(failureKey(first), failureKey(churned))
+  assert.equal(failureKey(first), failureKey(later))
+  assert.notEqual(failureKey(first), failureKey(differentSubject))
   assert.notEqual(failureKey(first), failureKey(differentReason))
-  assert.notEqual(failureKey(first), failureKey(differentCheck))
+})
+
+test('failure key gives each subject in one check its own identity', () => {
+  const combined = failureKey({
+    results: [{
+      name: 'misconfigured-agents',
+      ok: false,
+      error: [
+        '**permission-missing-grant-proof** (`fleet:ab36e325`) has incoherent mint/daemon join state after 23090 minutes.',
+        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+        '',
+        '**permission-profile-proof** (`fleet:37723d98`) has incoherent mint/daemon join state after 23090 minutes.',
+        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+      ].join('\n'),
+    }],
+  })
+
+  assert.match(combined, /misconfigured-agents:fleet:ab36e325:/)
+  assert.match(combined, /misconfigured-agents:fleet:37723d98:/)
+})
+
+test('new sibling failure notice still reports standing sections as ongoing', () => {
+  const standing = [
+    'agent-receiving: **task-notify-and-timers** (`fleet:67508f59`) has produced nothing for 126 minutes.',
+    '- holding a message from `fleet:9ef0239d` delivered 2026-08-10T03:48:39.862Z',
+    '- last produced: nothing on record',
+    '- last call from its own client: 2026-08-10T00:53:43.376Z (hibernating)',
+    '- daemon last saw the process 2565s ago',
+    '- **no `permission_grants` row for this daemon -- it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.**',
+  ].join('\n')
+  const withSibling = [
+    standing,
+    'file-materialization: The operation was aborted due to timeout',
+  ].join('\n')
+  const messageReport = failureNudgeMessageReport({
+    report: { summary: withSibling },
+    activeKey: failureKey(standing),
+  })
+
+  assert.match(messageReport.summary, /Still failing: agent-receiving: \*\*task-notify-and-timers\*\* \(`fleet:67508f59`\)/)
+  assert.match(messageReport.summary, /file-materialization: The operation was aborted due to timeout/)
+  assert.doesNotMatch(messageReport.summary, /holding a message from/)
 })
 
 test('chat round trip goes red when acked send is absent from receiver history', async () => {
@@ -525,12 +580,14 @@ test('misconfigured agent check detects stranded async joins but ignores young m
       },
     ],
     grantRows: [{ id: 'fleet:complete', session_id: 'session-complete', daemon_key: 'mini:testing', env_name: 'testing' }],
+    agentRowsByIds: async ids => ids.map(id => ({ id, dead: false })),
     now,
     joinGraceMs: 5 * 60_000,
   })
   assert.equal(result.checked, 2)
   assert.equal(result.young, 1)
 
+  let lookedUp = []
   await assert.rejects(
     checkMisconfiguredAgents({
       mintRows: [
@@ -565,11 +622,50 @@ test('misconfigured agent check detects stranded async joins but ignores young m
         { id: 'fleet:no-process', session_id: null, daemon_key: 'mini:testing', env_name: 'testing' },
         { id: 'fleet:mcp-never-joined', session_id: null, daemon_key: 'mini:testing', env_name: 'testing' },
       ],
+      agentRowsByIds: async ids => {
+        lookedUp = ids
+        return ids.map(id => ({ id, dead: false }))
+      },
       now,
       joinGraceMs: 5 * 60_000,
       sessionExists: session => session === 'fleet-mcp-never-joined',
     }),
     /no `permission_grants` row[\s\S]*no process_state and no session_id[\s\S]*tmux session still exists/,
+  )
+  assert.deepEqual(lookedUp, ['fleet:missing-grant', 'fleet:no-process', 'fleet:mcp-never-joined'])
+
+  const deadHistorical = await checkMisconfiguredAgents({
+    mintRows: [{
+      mint_id: 'dead-mint',
+      fleet_id: 'fleet:dead-agent',
+      friendly_name: 'dead-agent',
+      process_state: null,
+      session_id: null,
+      created_at: old,
+    }],
+    grantRows: [],
+    agentRowsByIds: async ids => ids.map(id => ({ id, dead: true })),
+    now,
+    joinGraceMs: 5 * 60_000,
+  })
+  assert.equal(deadHistorical.checked, 0)
+
+  await assert.rejects(
+    checkMisconfiguredAgents({
+      mintRows: [{
+        mint_id: 'pending-no-grant-mint',
+        fleet_id: 'fleet:pending-no-grant',
+        friendly_name: 'pending-no-grant',
+        process_state: null,
+        session_id: null,
+        created_at: old,
+      }],
+      grantRows: [],
+      agentRowsByIds: async () => [],
+      now,
+      joinGraceMs: 5 * 60_000,
+    }),
+    /pending-no-grant[\s\S]*no `permission_grants` row/,
   )
 })
 
