@@ -1969,8 +1969,75 @@ async function sendChat(to, message) {
   })
 }
 
-export function failureKey(summary) {
-  return String(summary || '').replace(/\d+/g, '#')
+function normalizeFailureReason(text) {
+  return String(text || '')
+    .replace(/`[^`]+`/g, '`#`')
+    .replace(/\d+/g, '#')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function keyPartsForFailure(name, error) {
+  const lines = String(error || '').split('\n').map(line => line.trim()).filter(Boolean)
+  const reasons = lines
+    .filter(line => line.startsWith('- '))
+    .map(line => normalizeFailureReason(line.slice(2)))
+  const stableReasons = reasons.length ? [...new Set(reasons)].sort() : [normalizeFailureReason(lines[0] || '')]
+  return `${name}:${stableReasons.join('|')}`
+}
+
+function keyPartsFromSummary(summary) {
+  const parts = []
+  let current = null
+  for (const line of String(summary || '').split('\n')) {
+    const match = line.match(/^([a-z][a-z0-9-]*):\s*(.*)$/)
+    if (match) {
+      if (current) parts.push(keyPartsForFailure(current.name, current.lines.join('\n')))
+      current = { name: match[1], lines: [match[2]] }
+    } else if (current) {
+      current.lines.push(line)
+    }
+  }
+  if (current) parts.push(keyPartsForFailure(current.name, current.lines.join('\n')))
+  return parts
+}
+
+export function failureKey(reportOrSummary) {
+  if (reportOrSummary && typeof reportOrSummary === 'object' && Array.isArray(reportOrSummary.results)) {
+    const parts = reportOrSummary.results
+      .filter(result => !result.ok)
+      .map(result => keyPartsForFailure(result.name, result.error))
+    return parts.sort().join('\n')
+  }
+  return keyPartsFromSummary(reportOrSummary).sort().join('\n')
+}
+
+function firstFailureLine(summary) {
+  return String(summary || '').split('\n').map(line => line.trim()).find(Boolean) || 'same failure signature'
+}
+
+export function composeFailureNudgeMessage({ report, unchanged, standingFor, firstAt, fellBack }) {
+  const message = [
+    unchanged
+      ? `**dev noticer: still failing, unchanged for ${standingFor} minutes** (first raised ${new Date(firstAt).toISOString()})`
+      : report.setupOnly ? '**dev noticer: probe setup needs repair**' : '**dev noticer: testing is failing**',
+    '',
+    ...(unchanged
+      ? [
+          `Still failing: ${firstFailureLine(report.summary)}`,
+          '',
+          '_Full failure details were sent when this condition first raised. Nothing here has changed since then; the next repeat is further out, and a changed finding interrupts immediately._',
+          '',
+        ]
+      : [report.summary, '']),
+    ...(fellBack ? [`_Delivery degraded: ${fellBack}._`, ''] : []),
+    `Environment: \`${CONFIG_NAME}\``,
+    `Fleet: \`${FLEET_SERVER}\``,
+    `Store: \`${STORE_SERVER}\``,
+    '',
+    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; async agent join coherence; bot heartbeat outcomes; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
+  ].join('\n')
+  return message
 }
 
 async function sendFailureNudge(report) {
@@ -1978,18 +2045,14 @@ async function sendFailureNudge(report) {
     writeHeartbeat('probe-setup-suppressed', { summary: report.summary })
     return
   }
-  // The key must be STABLE while the finding is unchanged, and the summary is
-  // not: `agent-receiving` says "has produced nothing for N minutes" and N grows
-  // every sweep, so every repeat looked like a brand-new finding and raised
-  // immediately. The backoff shipped tonight therefore never engaged once --
-  // all eleven agent-receiving nudges recorded `repeats: 0`, including three
-  // after the backoff landed, while app-chief2 was being told the same thing
-  // about the same two agents for hours.
+  // The key must be STABLE while the finding is unchanged, and the rendered
+  // summary is not: `agent-receiving` says "has produced nothing for N minutes"
+  // and `misconfigured-agents` enumerates every affected agent, so membership
+  // churn and elapsed-time prose must not make a known failing check look new.
   //
-  // Digits are collapsed so an elapsed-time counter cannot masquerade as news. A
-  // genuinely new finding still changes the words -- a different agent, a
-  // different check, a different reason -- and still interrupts immediately.
-  const key = failureKey(report.summary)
+  // A genuinely new finding still changes the key: a different check, or the
+  // same check failing for a different normalized reason, interrupts immediately.
+  const key = failureKey(report)
   const now = Date.now()
   const unchanged = activeFailure?.key === key
   if (unchanged) {
@@ -2006,21 +2069,13 @@ async function sendFailureNudge(report) {
     return
   }
   const standingFor = unchanged ? Math.round((now - activeFailure.firstAt) / 60_000) : 0
-  const message = [
-    unchanged
-      ? `**dev noticer: still failing, unchanged for ${standingFor} minutes** (first raised ${new Date(activeFailure.firstAt).toISOString()})`
-      : report.setupOnly ? '**dev noticer: probe setup needs repair**' : '**dev noticer: testing is failing**',
-    '',
-    report.summary,
-    '',
-    ...(unchanged ? ['_Nothing here has changed since the first notice. The next repeat is further out; a changed finding interrupts immediately._', ''] : []),
-    ...(fellBack ? [`_Delivery degraded: ${fellBack}._`, ''] : []),
-    `Environment: \`${CONFIG_NAME}\``,
-    `Fleet: \`${FLEET_SERVER}\``,
-    `Store: \`${STORE_SERVER}\``,
-    '',
-    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; async agent join coherence; bot heartbeat outcomes; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
-  ].join('\n')
+  const message = composeFailureNudgeMessage({
+    report,
+    unchanged,
+    standingFor,
+    firstAt: unchanged ? activeFailure.firstAt : now,
+    fellBack,
+  })
   for (const target of targets) {
     await sendChat(target, message)
   }

@@ -11,6 +11,8 @@ const {
   checkFileMaterialization,
   checkMcpSurface,
   checkBotHeartbeats,
+  composeFailureNudgeMessage,
+  failureKey,
   checkMisconfiguredAgents,
   checkResourceCleanup,
   runChecks,
@@ -148,6 +150,97 @@ test('chat round trip reads receiver history instead of trusting chat ack', asyn
   assert.equal(result.eventId, 42)
   assert.equal(probe.calls.some(call => call.type === 'chat'), true)
   assert.equal(historyCalls.length, 1)
+})
+
+test('unchanged failure repeat sends compact known-failing notice', () => {
+  const summary = [
+    'misconfigured-agents: **permission-missing-grant-proof** (`fleet:ab36e325`) has incoherent mint/daemon join state after 22979 minutes.',
+    '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+    '',
+    '**second-agent** (`fleet:22222222`) has incoherent mint/daemon join state after 22979 minutes.',
+    '- this line is part of the repeated full payload',
+  ].join('\n')
+  const message = composeFailureNudgeMessage({
+    report: { summary },
+    unchanged: true,
+    standingFor: 16,
+    firstAt: Date.parse('2026-08-10T03:42:31.134Z'),
+    fellBack: null,
+  })
+
+  assert.match(message, /still failing, unchanged for 16 minutes/)
+  assert.match(message, /Still failing: misconfigured-agents: \*\*permission-missing-grant-proof\*\*/)
+  assert.match(message, /Full failure details were sent when this condition first raised/)
+  assert.doesNotMatch(message, /second-agent/)
+  assert.doesNotMatch(message, /this line is part of the repeated full payload/)
+})
+
+test('new failure notice keeps the full finding payload', () => {
+  const summary = [
+    'misconfigured-agents: **permission-missing-grant-proof** (`fleet:ab36e325`) has incoherent mint/daemon join state after 22979 minutes.',
+    '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+    '',
+    '**second-agent** (`fleet:22222222`) has incoherent mint/daemon join state after 22979 minutes.',
+    '- this line is part of the full payload',
+  ].join('\n')
+  const message = composeFailureNudgeMessage({
+    report: { summary },
+    unchanged: false,
+    standingFor: 0,
+    firstAt: Date.parse('2026-08-10T03:42:31.134Z'),
+    fellBack: null,
+  })
+
+  assert.match(message, /testing is failing/)
+  assert.match(message, /second-agent/)
+  assert.match(message, /this line is part of the full payload/)
+})
+
+test('failure key ignores enumerated agent churn but keeps check and reason changes', () => {
+  const first = {
+    results: [{
+      name: 'misconfigured-agents',
+      ok: false,
+      error: [
+        '**permission-missing-grant-proof** (`fleet:ab36e325`) has incoherent mint/daemon join state after 22979 minutes.',
+        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+        '',
+        '**permission-profile-proof** (`fleet:37723d98`) has incoherent mint/daemon join state after 22979 minutes.',
+        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+      ].join('\n'),
+    }],
+  }
+  const churned = {
+    results: [{
+      name: 'misconfigured-agents',
+      ok: false,
+      error: [
+        '**different-agent** (`fleet:99999999`) has incoherent mint/daemon join state after 1 minutes.',
+        '- fleet seat exists, but there is no `permission_grants` row; daemon terminal operations cannot place it',
+      ].join('\n'),
+    }],
+  }
+  const differentReason = {
+    results: [{
+      name: 'misconfigured-agents',
+      ok: false,
+      error: [
+        '**different-agent** (`fleet:99999999`) has incoherent mint/daemon join state after 1 minutes.',
+        '- process_state exists for `fleet-different-agent`, but no session_id ever joined; the tmux session is gone',
+      ].join('\n'),
+    }],
+  }
+  const differentCheck = {
+    results: [{
+      name: 'bot-heartbeats',
+      ok: false,
+      error: '**todd** is declared for `testing` and has not written a heartbeat for 73 minutes.',
+    }],
+  }
+
+  assert.equal(failureKey(first), failureKey(churned))
+  assert.notEqual(failureKey(first), failureKey(differentReason))
+  assert.notEqual(failureKey(first), failureKey(differentCheck))
 })
 
 test('chat round trip goes red when acked send is absent from receiver history', async () => {
