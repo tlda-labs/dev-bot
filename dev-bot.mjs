@@ -61,6 +61,9 @@ export const configSchema = defineConfig({
   spawnWakeTimeoutMs: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS', default: 180_000, description: 'Overall spawn/wake probe deadline.', parse: configTypes.integer, validate: positive },
   spawnWakeEnabled: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_ENABLED', default: false, description: 'Whether the mutating disposable core phi probe runs after shadow verification.', parse: configTypes.boolean },
   spawnWakeModel: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_MODEL', default: '', description: 'Optional model override for the disposable probe agent.', parse: configTypes.string },
+  notificationConsumptionTimeoutMs: { env: 'TLDA_DEV_BOT_NOTIFICATION_CONSUMPTION_TIMEOUT_MS', default: 120_000, description: 'Deadline for live Claude/Codex notification canaries to consume and acknowledge a probe message.', parse: configTypes.integer, validate: positive },
+  notificationConsumptionClaudeModel: { env: 'TLDA_DEV_BOT_NOTIFICATION_CONSUMPTION_CLAUDE_MODEL', default: 'opus', description: 'Claude-family model alias used for the standing notification-consumption canary.', parse: configTypes.string },
+  notificationConsumptionCodexModel: { env: 'TLDA_DEV_BOT_NOTIFICATION_CONSUMPTION_CODEX_MODEL', default: 'terra', description: 'Codex-family model alias used for the standing notification-consumption canary.', parse: configTypes.string },
   linkedRemoteEnabled: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_ENABLED', default: false, description: 'Whether to exercise the disposable linked Git remote.', parse: configTypes.boolean },
   linkedRemoteIntervalMs: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_INTERVAL_MS', default: 1_800_000, description: 'Linked remote safety probe cadence in milliseconds.', parse: configTypes.integer, validate: positive },
   linkedRemoteUrl: { env: 'TLDA_DEV_BOT_LINKED_REMOTE_URL', default: '', description: 'Reachable disposable Git remote URL used instead of the local Git daemon fixture.', parse: configTypes.string },
@@ -100,6 +103,9 @@ const {
   intervalMs: INTERVAL_MS, failureCooldownMs: FAILURE_COOLDOWN_MS, requestTimeoutMs: REQUEST_TIMEOUT_MS,
   spawnWakeIntervalMs: SPAWN_WAKE_INTERVAL_MS, spawnWakeTimeoutMs: SPAWN_WAKE_TIMEOUT_MS,
   spawnWakeEnabled: SPAWN_WAKE_ENABLED, spawnWakeModel: SPAWN_WAKE_MODEL, probeDoc: PROBE_DOC,
+  notificationConsumptionTimeoutMs: NOTIFICATION_CONSUMPTION_TIMEOUT_MS,
+  notificationConsumptionClaudeModel: NOTIFICATION_CONSUMPTION_CLAUDE_MODEL,
+  notificationConsumptionCodexModel: NOTIFICATION_CONSUMPTION_CODEX_MODEL,
   linkedRemoteEnabled: LINKED_REMOTE_ENABLED, linkedRemoteIntervalMs: LINKED_REMOTE_INTERVAL_MS,
   linkedRemoteUrl: LINKED_REMOTE_URL, linkedRemoteTokenFile: LINKED_REMOTE_TOKEN_FILE,
   linkedRemoteHost: LINKED_REMOTE_HOST, linkedRemotePort: LINKED_REMOTE_PORT,
@@ -135,6 +141,7 @@ let sweepTimer = null
 let sweepInFlight = false
 let lastFleetEventId = 0
 let lastCheckOutcome = 'startup'
+let lastFailureKind = null
 let lastSuccessfulCheckAt = null
 // A standing failure is raised once and then repeated on a widening interval.
 // The old shape re-raised the identical sentence every FAILURE_COOLDOWN_MS
@@ -214,6 +221,24 @@ class ProbeSetupError extends Error {
   }
 }
 
+class CanaryProvisioningError extends ProbeSetupError {
+  constructor(message, { family } = {}) {
+    super(message)
+    this.name = 'CanaryProvisioningError'
+    this.failureKind = 'canary-provisioning'
+    this.family = family || null
+  }
+}
+
+class NotificationConsumptionError extends Error {
+  constructor(message, { family } = {}) {
+    super(message)
+    this.name = 'NotificationConsumptionError'
+    this.failureKind = 'notification-consumption'
+    this.family = family || null
+  }
+}
+
 class ProbeIndeterminateError extends Error {
   constructor(message) {
     super(message)
@@ -235,9 +260,14 @@ function healthDb() {
       reason TEXT NOT NULL,
       last_fleet_event_id INTEGER NOT NULL DEFAULT 0,
       last_check_outcome TEXT,
+      last_failure_kind TEXT,
       last_success_at TEXT,
       PRIMARY KEY (name, config)
     )`)
+    const columns = new Set(_healthDb.prepare(`PRAGMA table_info(bot_health)`).all().map(row => row.name))
+    if (!columns.has('last_failure_kind')) {
+      _healthDb.exec(`ALTER TABLE bot_health ADD COLUMN last_failure_kind TEXT`)
+    }
   } catch (e) {
     _healthDbFailed = true
     console.error(`[dev-bot] cannot open health state ${HEALTH_STATE_DB}: ${e.message}`)
@@ -249,14 +279,15 @@ function recordHealthState(entry) {
   try {
     healthDb()?.prepare(`INSERT INTO bot_health (
       name, config, updated_at, pid, reason, last_fleet_event_id,
-      last_check_outcome, last_success_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      last_check_outcome, last_failure_kind, last_success_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(name, config) DO UPDATE SET
       updated_at = excluded.updated_at,
       pid = excluded.pid,
       reason = excluded.reason,
       last_fleet_event_id = excluded.last_fleet_event_id,
       last_check_outcome = excluded.last_check_outcome,
+      last_failure_kind = excluded.last_failure_kind,
       last_success_at = excluded.last_success_at`).run(
       BOT_KEY,
       CONFIG_NAME,
@@ -265,6 +296,7 @@ function recordHealthState(entry) {
       entry.reason,
       Number(entry.lastFleetEventId) || 0,
       entry.lastCheckOutcome || null,
+      entry.lastFailureKind || null,
       entry.lastSuccessfulCheckAt || null,
     )
   } catch (e) {
@@ -283,6 +315,7 @@ function writeHeartbeat(reason, detail = {}) {
     store: STORE_SERVER,
     lastFleetEventId,
     lastCheckOutcome,
+    lastFailureKind,
     lastSuccessfulCheckAt,
     ...detail,
   }
@@ -689,6 +722,7 @@ export async function checkFileMaterialization({
 
 let lastSpawnWakeProbeAt = 0
 let spawnWakeProbeInFlight = false
+let notificationConsumptionProbeInFlight = false
 let lastLinkedRemoteProbeAt = 0
 let linkedRemoteProbeInFlight = false
 
@@ -1013,6 +1047,185 @@ async function waitForControlTrace(traceId, predicate, deadline) {
     ? lastTrace.events.map(e => `${e.operation}:${e.status}${e.error ? `:${e.error}` : ''}`).join(', ')
     : 'no retained trace'
   throw new ProbeIndeterminateError(`wake trace ${traceId} did not reach a terminal outcome (${summary})`)
+}
+
+const NOTIFICATION_CANARY_FAMILIES = [
+  { family: 'claude', name: `${BOT_KEY}-notify-canary-claude`, model: () => NOTIFICATION_CONSUMPTION_CLAUDE_MODEL },
+  { family: 'codex', name: `${BOT_KEY}-notify-canary-codex`, model: () => NOTIFICATION_CONSUMPTION_CODEX_MODEL },
+]
+
+function canaryProvisioningError(family, message) {
+  return new CanaryProvisioningError(`${family} canary provisioning failure: ${message}`, { family })
+}
+
+function notificationConsumptionError(family, message) {
+  return new NotificationConsumptionError(`${family} notification consumption failure: ${message}`, { family })
+}
+
+function requestPayload(response) {
+  return response && typeof response === 'object' && response.result && typeof response.result === 'object'
+    ? response.result
+    : response
+}
+
+async function proveCanaryRoute({ family, agentId, request = sendRequest, resolve = resolveAgent, readSeat = readAgentSeat }) {
+  const agent = await resolve(agentId)
+  if (!agent || agent.dead) {
+    throw canaryProvisioningError(family, `${agentId} does not resolve to a live agent`)
+  }
+  if (metadataOf(agent).shell === true) {
+    throw canaryProvisioningError(family, `${agentId} is still a pending shell`)
+  }
+  const seat = await readSeat(agent.id)
+  if (!seat?.session_id || !seat?.daemon_key || !seat?.terminal_capability) {
+    throw canaryProvisioningError(family, `${agent.id} has no current daemon route/terminal seat`)
+  }
+  const alive = requestPayload(await request({ type: 'check-alive', agent: agent.id }, REQUEST_TIMEOUT_MS))
+  if (alive?.state !== 'alive') {
+    throw canaryProvisioningError(family, `${agent.id} route exists but daemon reports state=${alive?.state || 'unknown'} reason=${alive?.reason || 'none'}`)
+  }
+  return { agent, seat }
+}
+
+async function ensureNotificationCanary(spec, {
+  request = sendRequest,
+  waitReady = waitForSpawnReady,
+  resolve = resolveAgent,
+  readSeat = readAgentSeat,
+  now = () => Date.now(),
+} = {}) {
+  const model = String(spec.model() || '').trim()
+  if (!model) throw canaryProvisioningError(spec.family, 'no model configured')
+  const existing = await resolve(spec.name)
+  if (existing && !existing.dead && metadataOf(existing).shell !== true) {
+    const route = await proveCanaryRoute({ family: spec.family, agentId: existing.id, request, resolve, readSeat })
+    return { ...route, spawned: false, model }
+  }
+
+  const spawn = requestPayload(await request({
+    type: 'spawn',
+    fresh: true,
+    name: spec.name,
+    cwd: REPO_ROOT,
+    model,
+    effort: 'low',
+    mailboxTarget: AGENT_ID,
+  }, REQUEST_TIMEOUT_MS))
+  if (!spawn?.ok || spawn.status !== 'pending' || !spawn.agent_id) {
+    throw canaryProvisioningError(spec.family, `spawn did not return a pending canary agent (${JSON.stringify(spawn)})`)
+  }
+  const ready = await waitReady(spawn.agent_id, now() + NOTIFICATION_CONSUMPTION_TIMEOUT_MS)
+  const route = await proveCanaryRoute({ family: spec.family, agentId: ready.agent.id, request, resolve, readSeat })
+  return { ...route, spawned: true, mailboxId: spawn.mailbox_id || null, model }
+}
+
+function eventHasRecipient(event, agentId) {
+  const recipients = event.recipients || event.to || event.to_ids || event.recipient_ids || null
+  if (!recipients) return true
+  if (Array.isArray(recipients)) return recipients.includes(agentId)
+  return String(recipients || '').includes(agentId)
+}
+
+function eventFrom(event) {
+  return event.from_id || event.from || event.sender || event.agent_id || null
+}
+
+async function waitForCanaryReply({ family, canaryId, token, since, deadline, request = sendRequest, now = () => Date.now(), sleepMs = sleep }) {
+  while (now() < deadline) {
+    const history = requestPayload(await request({
+      type: 'fleet-search',
+      query: token,
+      me: AGENT_ID,
+      agent: AGENT_ID,
+      agentOnly: true,
+      historyOnly: true,
+      eventOnly: true,
+      eventType: 'chat',
+      since,
+      limit: 50,
+    }, 5000))
+    const events = (Array.isArray(history?.results) ? history.results : []).filter(r => r.source === 'fleet')
+    const found = events.find(event => {
+      const text = event.text || event.message || ''
+      return text.includes(token) && eventFrom(event) === canaryId && eventHasRecipient(event, AGENT_ID)
+    })
+    if (found) return found
+    await sleepMs(1000)
+  }
+  throw notificationConsumptionError(family, `${canaryId} did not produce token ${token} before deadline`)
+}
+
+async function checkOneNotificationCanary(spec, {
+  request = sendRequest,
+  waitReady = waitForSpawnReady,
+  resolve = resolveAgent,
+  readSeat = readAgentSeat,
+  uuid = randomUUID,
+  now = () => Date.now(),
+  sleepMs = sleep,
+} = {}) {
+  const canary = await ensureNotificationCanary(spec, { request, waitReady, resolve, readSeat, now })
+  const hibernated = requestPayload(await request({ type: 'hibernate-session', agent: canary.agent.id }, REQUEST_TIMEOUT_MS))
+  if (!hibernated?.ok) {
+    throw canaryProvisioningError(spec.family, `hibernate did not confirm ${canary.agent.id} can be controlled (${JSON.stringify(hibernated)})`)
+  }
+  const token = `notify-consumed:${spec.family}:${uuid()}`
+  const since = new Date(now() - 60_000).toISOString()
+  const sentAt = new Date().toISOString()
+  const message = [
+    `Dev bot live notification consumption probe.`,
+    `Call inbox() now, then reply to ${AGENT_NAME} with exactly this token:`,
+    token,
+  ].join('\n')
+  const sent = requestPayload(await request({
+    type: 'chat',
+    from: AGENT_ID,
+    to: canary.agent.id,
+    message,
+    _tempId: `${BOT_KEY}:notification-consumption:${token}`,
+  }, REQUEST_TIMEOUT_MS))
+  const eventIds = Array.isArray(sent?.event_ids) ? sent.event_ids.map(Number).filter(Number.isFinite) : []
+  if (!eventIds.length) {
+    throw notificationConsumptionError(spec.family, `chat to ${canary.agent.id} returned no accepted event id`)
+  }
+  const reply = await waitForCanaryReply({
+    family: spec.family,
+    canaryId: canary.agent.id,
+    token,
+    since,
+    deadline: now() + NOTIFICATION_CONSUMPTION_TIMEOUT_MS,
+    request,
+    now,
+    sleepMs,
+  })
+  return {
+    family: spec.family,
+    canaryId: canary.agent.id,
+    canaryName: canary.agent.friendly_name || canary.agent.name || spec.name,
+    model: canary.model,
+    spawned: canary.spawned,
+    sentEventIds: eventIds,
+    replyEventId: reply.id || reply.event_id || null,
+    sentAt,
+    consumedAt: reply.timestamp || reply.ts || null,
+    seat: {
+      sessionId: canary.seat.session_id,
+      daemonKey: canary.seat.daemon_key,
+    },
+  }
+}
+
+export async function checkNotificationConsumption(options = {}) {
+  if (notificationConsumptionProbeInFlight) {
+    return { skipped: true, reason: 'previous probe still in flight' }
+  }
+  notificationConsumptionProbeInFlight = true
+  try {
+    const results = await Promise.all(NOTIFICATION_CANARY_FAMILIES.map(spec => checkOneNotificationCanary(spec, options)))
+    return { canaries: results }
+  } finally {
+    notificationConsumptionProbeInFlight = false
+  }
 }
 
 async function cleanupSpawnWakeProbe({ agentId, taskId }) {
@@ -1823,7 +2036,7 @@ export async function checkBotHeartbeats({
 function compactFailure(results) {
   return results
     .filter(r => !r.ok)
-    .map(r => `${r.name}: ${r.indeterminate ? 'indeterminate: ' : ''}${r.error}`)
+    .map(r => `${r.name}${r.failureKind ? ` [${r.failureKind}]` : ''}${r.family ? ` [${r.family}]` : ''}: ${r.indeterminate ? 'indeterminate: ' : ''}${r.error}`)
     .join('\n')
 }
 
@@ -1837,7 +2050,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
+const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'notification-consumption', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
 
 export async function checkResourceCleanup({
   previewReaper = reapIdlePreviews,
@@ -1909,6 +2122,7 @@ function defaultChecks() {
     ['chat-roundtrip', checkMessageRoundTrip],
     ['mcp-surface', checkMcpSurface],
     ['spawn-wake-seat', checkSpawnWakeSeat],
+    ['notification-consumption', checkNotificationConsumption],
     ['linked-remote-safety', checkLinkedRemoteSafety],
     ['agent-receiving', checkAgentReceiving],
     ['misconfigured-agents', checkMisconfiguredAgents],
@@ -1935,6 +2149,8 @@ export async function runChecks({ checks = defaultChecks() } = {}) {
         ok: false,
         setup: e instanceof ProbeSetupError,
         indeterminate: e instanceof ProbeIndeterminateError,
+        failureKind: e?.failureKind || null,
+        family: e?.family || null,
         error: e?.message || String(e),
       })
     }
@@ -1962,6 +2178,7 @@ export async function runChecks({ checks = defaultChecks() } = {}) {
   return {
     ok: false,
     setupOnly: testFailures.length === 0 && setupFailures.length > 0,
+    failureKind: [...new Set(failures.map(r => r.failureKind).filter(Boolean))].sort().join('+') || null,
     results,
     missing,
     blocked,
@@ -1999,6 +2216,59 @@ async function nudgeTargets() {
   const asleep = await holders(NUDGE_LABEL)
   if (!asleep.length) return { targets: [], fellBack: null }
   return { targets: asleep, fellBack: `no awake holder of \`${NUDGE_LABEL}\`; queued to ${asleep.length} hibernating holder(s)` }
+}
+
+function tmuxPaste(sessionId, message) {
+  execFileSync('tmux', ['set-buffer', message], { stdio: 'ignore' })
+  execFileSync('tmux', ['paste-buffer', '-t', sessionId], { stdio: 'ignore' })
+  execFileSync('tmux', ['send-keys', '-t', sessionId, 'Enter'], { stdio: 'ignore' })
+}
+
+export async function sendNotificationConsumptionTmuxAlarm(report, {
+  fleetServer = FLEET_SERVER,
+  nudgeLabel = NUDGE_LABEL,
+  requestJson = fetchJson,
+  readSeat = readAgentSeat,
+  paste = tmuxPaste,
+} = {}) {
+  if (!String(report?.failureKind || '').split('+').includes('notification-consumption')) {
+    return { skipped: true, reason: 'not notification-consumption' }
+  }
+  if (!nudgeLabel) {
+    return { ok: false, failureKind: 'alarm-no-recipient', reason: 'no on-call label configured' }
+  }
+  const data = await requestJson(fleetServer, `/api/fleet-table?filter=${encodeURIComponent(`awake & ${nudgeLabel}`)}&limit=500`)
+  const agents = (Array.isArray(data?.agents) ? data.agents : []).filter(isNudgeTarget)
+  if (!agents.length) {
+    return { ok: false, failureKind: 'alarm-no-recipient', reason: `no awake holder of ${nudgeLabel}` }
+  }
+  const message = [
+    `dev bot: notification consumption check failed`,
+    '',
+    report.summary || 'notification-consumption failure',
+    '',
+    `Alarm path: direct tmux paste from ${BOT_KEY}; not fleet chat/MCP/wake.`,
+  ].join('\n')
+  const delivered = []
+  const failures = []
+  for (const agent of agents) {
+    try {
+      const seat = await readSeat(agent.id)
+      const sessionId = seat?.session_id || agent.tmux_session || metadataOf(agent).tmux_session || null
+      if (!sessionId) {
+        failures.push(`${agent.id}: no tmux session in current seat`)
+        continue
+      }
+      paste(sessionId, message)
+      delivered.push({ agent: agent.id, sessionId })
+    } catch (e) {
+      failures.push(`${agent.id}: ${e?.message || String(e)}`)
+    }
+  }
+  if (!delivered.length) {
+    return { ok: false, failureKind: 'alarm-no-recipient', reason: failures.join('; ') || `no tmux pane reached for ${nudgeLabel}` }
+  }
+  return { ok: true, delivered, ...(failures.length ? { failures } : {}) }
 }
 
 async function sendChat(to, message) {
@@ -2109,7 +2379,7 @@ export function composeFailureNudgeMessage({ report, unchanged, standingFor, fir
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; async agent join coherence; bot heartbeat outcomes; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
+    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; Claude/Codex live notification consumption canaries; async agent join coherence; bot heartbeat outcomes; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
   ].join('\n')
   return message
 }
@@ -2235,17 +2505,34 @@ async function sweep() {
       // express. See REQUIRED_CHECKS.
       if (report.missing?.length || report.blocked?.length) {
         lastCheckOutcome = 'degraded'
+        lastFailureKind = null
         writeHeartbeat('degraded', { ...detail, missing: report.missing, blocked: report.blocked })
       } else {
         lastCheckOutcome = 'healthy'
+        lastFailureKind = null
         lastSuccessfulCheckAt = new Date().toISOString()
         writeHeartbeat('healthy', detail)
       }
       return
     }
-    lastCheckOutcome = report.setupOnly ? 'setup-failed' : 'failed'
+    lastFailureKind = report.failureKind || null
+    lastCheckOutcome = report.failureKind || (report.setupOnly ? 'setup-failed' : 'failed')
     if (report.setupOnly) {
       writeHeartbeat('probe-setup-failed', { summary: report.summary })
+    }
+    const tmuxAlarm = await sendNotificationConsumptionTmuxAlarm(report).catch(e => ({
+      ok: false,
+      failureKind: 'alarm-no-recipient',
+      reason: e?.message || String(e),
+    }))
+    if (tmuxAlarm && !tmuxAlarm.skipped) {
+      if (tmuxAlarm.ok) {
+        writeHeartbeat('notification-consumption-tmux-alarm', tmuxAlarm)
+      } else {
+        lastFailureKind = [report.failureKind, tmuxAlarm.failureKind].filter(Boolean).join('+') || tmuxAlarm.failureKind || null
+        lastCheckOutcome = lastFailureKind || lastCheckOutcome
+        writeHeartbeat('notification-consumption-tmux-alarm-failed', tmuxAlarm)
+      }
     }
     await sendFailureNudge(report)
   } catch (e) {

@@ -10,6 +10,8 @@ const {
   checkDocumentRenders,
   checkFileMaterialization,
   checkMcpSurface,
+  checkNotificationConsumption,
+  sendNotificationConsumptionTmuxAlarm,
   checkBotHeartbeats,
   composeFailureNudgeMessage,
   failureKey,
@@ -508,6 +510,125 @@ test('MCP surface goes red when chat ack is absent from thread readback', async 
     /MCP chat accepted but thread readback did not contain the message/,
   )
   assert.equal(probe.calls.some(call => call.type === 'mark-dead'), true)
+})
+
+function fakeNotificationCanarySurface({ withSeat = true, reply = true } = {}) {
+  const calls = []
+  const resolve = async agent => {
+    const name = String(agent).replace(/^fleet:/, '')
+    return {
+      id: `fleet:${name}`,
+      friendly_name: name,
+      dead: false,
+      metadata: { model: name.includes('claude') ? 'opus' : 'terra' },
+    }
+  }
+  return {
+    calls,
+    resolve,
+    readSeat: async agentId => withSeat
+      ? { session_id: `session:${agentId}`, daemon_key: 'mini:testing', terminal_capability: true }
+      : null,
+    request: async message => {
+      calls.push(message)
+      if (message.type === 'check-alive') return { state: 'alive' }
+      if (message.type === 'hibernate-session') return { ok: true }
+      if (message.type === 'chat') return { event_ids: [calls.length] }
+      if (message.type === 'fleet-search') {
+        return {
+          results: reply ? [{
+            source: 'fleet',
+            id: 900 + calls.length,
+            from_id: message.query.includes(':claude:') ? 'fleet:dev-notify-canary-claude' : 'fleet:dev-notify-canary-codex',
+            recipients: ['fleet:dev'],
+            text: message.query,
+            timestamp: new Date().toISOString(),
+          }] : [],
+        }
+      }
+      throw new Error(`unexpected ${message.type}`)
+    },
+  }
+}
+
+test('notification consumption probe requires canary-produced replies', async () => {
+  const surface = fakeNotificationCanarySurface()
+  const result = await checkNotificationConsumption({
+    ...surface,
+    uuid: (() => {
+      const values = ['claude-token', 'codex-token']
+      return () => values.shift()
+    })(),
+    now: () => 1_000_000,
+    sleepMs: async () => {},
+  })
+  assert.deepEqual(result.canaries.map(row => row.family).sort(), ['claude', 'codex'])
+  assert.equal(surface.calls.filter(call => call.type === 'chat').length, 2)
+  assert.equal(surface.calls.filter(call => call.type === 'fleet-search').length, 2)
+})
+
+test('notification canary with no daemon route is provisioning failure, not consumption failure', async () => {
+  const surface = fakeNotificationCanarySurface({ withSeat: false })
+  await assert.rejects(
+    checkNotificationConsumption({
+      ...surface,
+      now: () => 1_000_000,
+      sleepMs: async () => {},
+    }),
+    error => {
+      assert.equal(error.failureKind, 'canary-provisioning')
+      assert.match(error.message, /canary provisioning failure/)
+      return true
+    },
+  )
+})
+
+test('runChecks carries notification failure kind into the report', async () => {
+  const report = await runChecks({
+    checks: [['notification-consumption', async () => {
+      const err = new Error('codex notification consumption failure: token missing')
+      err.failureKind = 'notification-consumption'
+      err.family = 'codex'
+      throw err
+    }]],
+  })
+  assert.equal(report.ok, false)
+  assert.equal(report.failureKind, 'notification-consumption')
+  assert.match(report.summary, /notification-consumption/)
+  assert.match(report.summary, /codex/)
+})
+
+test('notification consumption tmux alarm resolves awake on-call at alarm time', async () => {
+  const pasted = []
+  const result = await sendNotificationConsumptionTmuxAlarm({
+    failureKind: 'notification-consumption',
+    summary: 'notification-consumption [codex]: token missing',
+  }, {
+    nudgeLabel: 'on-call',
+    requestJson: async (base, urlPath) => {
+      assert.match(urlPath, /awake%20%26%20on-call/)
+      return { agents: [{ id: 'fleet:oncall', labels: ['on-call'], dead: false }] }
+    },
+    readSeat: async agentId => ({ session_id: `tmux:${agentId}`, daemon_key: 'mini:testing', terminal_capability: true }),
+    paste: (sessionId, message) => pasted.push({ sessionId, message }),
+  })
+  assert.equal(result.ok, true)
+  assert.deepEqual(pasted.map(row => row.sessionId), ['tmux:fleet:oncall'])
+  assert.match(pasted[0].message, /direct tmux paste/)
+})
+
+test('notification consumption tmux alarm records missing on-call holder', async () => {
+  const result = await sendNotificationConsumptionTmuxAlarm({
+    failureKind: 'notification-consumption',
+    summary: 'notification-consumption [codex]: token missing',
+  }, {
+    nudgeLabel: 'on-call',
+    requestJson: async () => ({ agents: [] }),
+    paste: () => { throw new Error('should not paste') },
+  })
+  assert.equal(result.ok, false)
+  assert.equal(result.failureKind, 'alarm-no-recipient')
+  assert.match(result.reason, /no awake holder/)
 })
 
 test('bot health distinguishes beating, stopped, uninstrumented, and alive-but-deaf', async () => {
