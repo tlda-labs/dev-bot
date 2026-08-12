@@ -93,7 +93,7 @@ test('reaps only after a managed session stays empty for the idle threshold', as
   assert.equal(calls.filter(call => call.includes('reap')).length, 1)
 })
 
-test('removes only merged clean idle worktrees and evicts oldest idle dependency caches', async () => {
+test('records merged clean idle worktrees as removable WITHOUT removing them, and evicts oldest idle dependency caches', async () => {
   const removedNodeModules = []
   const calls = []
   const worktrees = [
@@ -140,9 +140,16 @@ test('removes only merged clean idle worktrees and evicts oldest idle dependency
   })
 
   const result = await cleanup.sweep()
-  assert.deepEqual(result.removedWorktrees.map(entry => entry.path), ['/merged'])
-  assert.deepEqual(removedNodeModules, ['/old/node_modules', '/dirty/node_modules', '/abandoned/node_modules', '/recent/node_modules'])
-  assert.equal(calls.some(call => call.includes('/dirty') && call.includes('worktree') && call.includes('remove')), false)
+  // `/merged` is still classified removable — that record is the whole point, so
+  // we learn the real rate — but the sweep must no longer remove anything. The
+  // predicate is blind to ignored files, so removing on it destroyed agents' work
+  // in `scratch/`; see the stop-loss note in resource-cleanup.mjs.
+  assert.deepEqual(result.removable.map(entry => entry.path), ['/merged'])
+  assert.deepEqual(result.removedWorktrees, [])
+  assert.equal(calls.some(call => call.includes('worktree') && call.includes('remove')), false)
+  // `/merged` is no longer removed, so it stays in the pool and its node_modules
+  // is now an eviction candidate like every other retained worktree.
+  assert.deepEqual(removedNodeModules, ['/old/node_modules', '/merged/node_modules', '/dirty/node_modules', '/abandoned/node_modules', '/recent/node_modules'])
   assert.equal(calls.some(call => call.includes('/active') && call.includes('status')), false)
   assert.deepEqual(result.pinned.map(entry => entry.path), ['/active'])
   assert.deepEqual(result.abandoned.map(entry => entry.path), ['/abandoned'])

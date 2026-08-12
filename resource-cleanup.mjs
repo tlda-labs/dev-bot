@@ -19,7 +19,11 @@ function parseWorktrees(output) {
       const space = line.indexOf(' ')
       return space < 0 ? [line, true] : [line.slice(0, space), line.slice(space + 1)]
     }))
-    return { path: path.resolve(fields.worktree), head: fields.HEAD || null }
+    return {
+      path: path.resolve(fields.worktree),
+      head: fields.HEAD || null,
+      branch: typeof fields.branch === 'string' ? fields.branch.replace(/^refs\/heads\//, '') : null,
+    }
   }).filter(entry => entry.path)
 }
 
@@ -69,6 +73,7 @@ export function createWorktreeCleanup({
     const activeCwds = await listActiveCwds()
     const isActive = worktree => [...activeCwds].some(cwd => containsPath(worktree.path, cwd))
     const removedWorktrees = []
+    const removable = []
     const pinned = []
     const abandoned = []
     const unremovable = []
@@ -98,21 +103,27 @@ export function createWorktreeCleanup({
         if (error?.code === 1) continue
         throw error
       }
-      // A worktree git refuses to remove — one containing submodules, say — is a
-      // property of that worktree, not of the sweep. Letting it throw abandoned
-      // every later worktree and, because the caller only advances its clock
-      // after sweep() returns, retried the same doomed removal every minute and
-      // never published a status report.
-      try {
-        await run('git', ['-C', repoRoot, 'worktree', 'remove', worktree.path], {
-          timeout: 10 * 60_000,
-          encoding: 'utf8',
-        })
-      } catch (error) {
-        unremovable.push({ ...worktree, error: error?.stderr?.trim() || error?.message || String(error) })
-        continue
-      }
-      removedWorktrees.push(worktree)
+      // STOP-LOSS: classify, record, and do NOT remove.
+      //
+      // `git status --porcelain` is blind to ignored files, and `git worktree
+      // remove` does not count them as a reason to refuse. So a worktree holding
+      // only `scratch/plan.md` reads clean here and was deleted along with the
+      // file — and AGENTS.md tells every agent to put plans and reports in
+      // exactly that directory. A branch with no commits passes the merged check
+      // too, because its head is still the base commit. Measured: of five test
+      // worktrees, the one containing only a gitignored plan was removed and the
+      // plan was gone; modified-tracked and untracked-source worktrees survived.
+      //
+      // Removal is off until the predicate can tell ignored BUILD CACHE (which is
+      // reclaimable) from ignored AGENT CONTENT (which is someone's work). That is
+      // a product question about what this sweep is for, and it is Skip's.
+      //
+      // Recording the decision is the point: the old path logged only failures, so
+      // there was no record of what it took and the question could not be answered
+      // afterwards. Everything else this sweep does — node_modules eviction, the pw
+      // pool, preview reaping — is untouched.
+      removable.push({ ...worktree, reason: 'clean per `status --porcelain` (ignored files invisible) and head is an ancestor of main' })
+      console.log(`[worktree-cleanup] WOULD REMOVE ${worktree.path} branch=${worktree.branch || '(detached)'} head=${worktree.head || '?'} — removal disabled pending predicate`)
     }
 
     const remaining = worktrees.filter(worktree =>
@@ -148,6 +159,7 @@ export function createWorktreeCleanup({
       abandoned,
       unremovable,
       removedWorktrees,
+      removable,
     }
   }
   return { sweep }
