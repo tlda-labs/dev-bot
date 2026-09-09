@@ -222,11 +222,12 @@ class ProbeSetupError extends Error {
 }
 
 class CanaryProvisioningError extends ProbeSetupError {
-  constructor(message, { family } = {}) {
+  constructor(message, { family, reason } = {}) {
     super(message)
     this.name = 'CanaryProvisioningError'
     this.failureKind = 'canary-provisioning'
     this.family = family || null
+    this.reason = reason || null
   }
 }
 
@@ -1054,8 +1055,8 @@ const NOTIFICATION_CANARY_FAMILIES = [
   { family: 'codex', name: `${BOT_KEY}-notify-canary-codex`, model: () => NOTIFICATION_CONSUMPTION_CODEX_MODEL },
 ]
 
-function canaryProvisioningError(family, message) {
-  return new CanaryProvisioningError(`${family} canary provisioning failure: ${message}`, { family })
+function canaryProvisioningError(family, message, reason = null) {
+  return new CanaryProvisioningError(`${family} canary provisioning failure: ${message}`, { family, reason })
 }
 
 function notificationConsumptionError(family, message) {
@@ -1068,7 +1069,15 @@ function requestPayload(response) {
     : response
 }
 
-async function proveCanaryRoute({ family, agentId, request = sendRequest, resolve = resolveAgent, readSeat = readAgentSeat }) {
+function isCheckAliveTransportTimeout(error) {
+  return /^check-alive timed out after \d+ms$/.test(String(error?.message || error))
+}
+
+async function wakeNotificationCanary(agentId) {
+  return fetchJson(FLEET_SERVER, `/api/agents/${encodeURIComponent(agentId)}/wake`, { method: 'POST' })
+}
+
+async function proveCanaryRoute({ family, agentId, request = sendRequest, resolve = resolveAgent, readSeat = readAgentSeat, wake = wakeNotificationCanary }) {
   const agent = await resolve(agentId)
   if (!agent || agent.dead) {
     throw canaryProvisioningError(family, `${agentId} does not resolve to a live agent`)
@@ -1077,28 +1086,67 @@ async function proveCanaryRoute({ family, agentId, request = sendRequest, resolv
     throw canaryProvisioningError(family, `${agentId} is still a pending shell`)
   }
   const seat = await readSeat(agent.id)
-  if (!seat?.session_id || !seat?.daemon_key || !seat?.terminal_capability) {
-    throw canaryProvisioningError(family, `${agent.id} has no current daemon route/terminal seat`)
+  if (!seat?.daemon_key) {
+    throw canaryProvisioningError(family, `${agent.id} has no current daemon route/terminal seat`, 'missing-route')
   }
-  const alive = requestPayload(await request({ type: 'check-alive', agent: agent.id }, REQUEST_TIMEOUT_MS))
+  let alive
+  try {
+    alive = requestPayload(await request({ type: 'check-alive', agent: agent.id }, REQUEST_TIMEOUT_MS))
+  } catch (error) {
+    if (isCheckAliveTransportTimeout(error)) {
+      throw canaryProvisioningError(family, `${agent.id} check-alive transport timed out`, 'indeterminate')
+    }
+    throw error
+  }
+  const wakeable = alive?.state === 'hibernating'
+    || (alive?.state === 'dead' && /terminal capability unavailable|no tmux/i.test(String(alive?.reason || '')))
+  if (wakeable) {
+    let woke
+    try {
+      woke = requestPayload(await wake(agent.id))
+    } catch (error) {
+      throw canaryProvisioningError(family, `wake failed for ${agent.id}: ${error?.message || error}`, 'wake-failed')
+    }
+    if (!woke?.ok || (woke.agent_id && woke.agent_id !== agent.id)) {
+      throw canaryProvisioningError(family, `wake did not confirm the same canary identity ${agent.id} (${JSON.stringify(woke)})`, 'wake-refused')
+    }
+    const resumed = await resolve(agent.id)
+    const resumedSeat = resumed?.id === agent.id ? await readSeat(resumed.id) : null
+    if (!resumed || resumed.dead || resumed.id !== agent.id || !resumedSeat?.session_id || !resumedSeat?.terminal_capability || resumedSeat.daemon_key !== seat.daemon_key) {
+      throw canaryProvisioningError(family, `wake did not preserve ${agent.id} on daemon route ${seat.daemon_key}`, 'wake-route-mismatch')
+    }
+    try {
+      alive = requestPayload(await request({ type: 'check-alive', agent: resumed.id }, REQUEST_TIMEOUT_MS))
+    } catch (error) {
+      if (isCheckAliveTransportTimeout(error)) {
+        throw canaryProvisioningError(family, `${resumed.id} post-wake check-alive transport timed out`, 'indeterminate')
+      }
+      throw error
+    }
+    if (alive?.state === 'alive') return { agent: resumed, seat: resumedSeat }
+  }
   if (alive?.state !== 'alive') {
     throw canaryProvisioningError(family, `${agent.id} route exists but daemon reports state=${alive?.state || 'unknown'} reason=${alive?.reason || 'none'}`)
+  }
+  if (!seat.session_id || !seat.terminal_capability) {
+    throw canaryProvisioningError(family, `${agent.id} has no current daemon route/terminal seat`)
   }
   return { agent, seat }
 }
 
-async function ensureNotificationCanary(spec, {
+export async function ensureNotificationCanary(spec, {
   request = sendRequest,
   waitReady = waitForSpawnReady,
   resolve = resolveAgent,
   readSeat = readAgentSeat,
+  wake = wakeNotificationCanary,
   now = () => Date.now(),
 } = {}) {
   const model = String(spec.model() || '').trim()
   if (!model) throw canaryProvisioningError(spec.family, 'no model configured')
   const existing = await resolve(spec.name)
   if (existing && !existing.dead && metadataOf(existing).shell !== true) {
-    const route = await proveCanaryRoute({ family: spec.family, agentId: existing.id, request, resolve, readSeat })
+    const route = await proveCanaryRoute({ family: spec.family, agentId: existing.id, request, resolve, readSeat, wake })
     return { ...route, spawned: false, model }
   }
 
@@ -1115,7 +1163,7 @@ async function ensureNotificationCanary(spec, {
     throw canaryProvisioningError(spec.family, `spawn did not return a pending canary agent (${JSON.stringify(spawn)})`)
   }
   const ready = await waitReady(spawn.agent_id, now() + NOTIFICATION_CONSUMPTION_TIMEOUT_MS)
-  const route = await proveCanaryRoute({ family: spec.family, agentId: ready.agent.id, request, resolve, readSeat })
+  const route = await proveCanaryRoute({ family: spec.family, agentId: ready.agent.id, request, resolve, readSeat, wake })
   return { ...route, spawned: true, mailboxId: spawn.mailbox_id || null, model }
 }
 
@@ -1160,11 +1208,12 @@ async function checkOneNotificationCanary(spec, {
   waitReady = waitForSpawnReady,
   resolve = resolveAgent,
   readSeat = readAgentSeat,
+  wake = wakeNotificationCanary,
   uuid = randomUUID,
   now = () => Date.now(),
   sleepMs = sleep,
 } = {}) {
-  const canary = await ensureNotificationCanary(spec, { request, waitReady, resolve, readSeat, now })
+  const canary = await ensureNotificationCanary(spec, { request, waitReady, resolve, readSeat, wake, now })
   const hibernated = requestPayload(await request({ type: 'hibernate-session', agent: canary.agent.id }, REQUEST_TIMEOUT_MS))
   if (!hibernated?.ok) {
     throw canaryProvisioningError(spec.family, `hibernate did not confirm ${canary.agent.id} can be controlled (${JSON.stringify(hibernated)})`)

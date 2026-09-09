@@ -11,6 +11,7 @@ const {
   checkFileMaterialization,
   checkMcpSurface,
   checkNotificationConsumption,
+  ensureNotificationCanary,
   sendNotificationConsumptionTmuxAlarm,
   checkBotHeartbeats,
   composeFailureNudgeMessage,
@@ -581,6 +582,106 @@ test('notification canary with no daemon route is provisioning failure, not cons
       return true
     },
   )
+})
+
+function notificationCanaryProvisioningSurface({ alive = ['alive'], wakeResult = { ok: true, agent_id: 'fleet:canary' }, resolved = null, seats = null } = {}) {
+  const calls = []
+  const agent = { id: 'fleet:canary', friendly_name: 'canary', dead: false, metadata: { model: 'opus' } }
+  const defaultSeat = { session_id: 'session:canary', daemon_key: 'mini:testing', terminal_capability: true }
+  return {
+    calls,
+    agent,
+    resolve: async () => resolved?.length ? resolved.shift() : agent,
+    readSeat: async () => seats?.length ? seats.shift() : defaultSeat,
+    wake: async agentId => {
+      calls.push({ type: 'wake', agent: agentId })
+      if (wakeResult instanceof Error) throw wakeResult
+      return wakeResult
+    },
+    request: async message => {
+      calls.push(message)
+      if (message.type !== 'check-alive') throw new Error(`unexpected ${message.type}`)
+      const next = alive.shift()
+      if (next instanceof Error) throw next
+      return { state: next.state || next, reason: next.reason }
+    },
+  }
+}
+
+const canarySpec = { family: 'claude', name: 'canary', model: () => 'opus' }
+const reachedConsumption = calls => calls.some(call => ['hibernate-session', 'chat', 'fleet-search'].includes(call.type))
+
+test('hibernating and terminal-capability dead canaries wake in place', async () => {
+  for (const first of [
+    'hibernating',
+    { state: 'dead', reason: 'daemon check-alive: terminal capability unavailable' },
+  ]) {
+    const surface = notificationCanaryProvisioningSurface({ alive: [first, 'alive'] })
+    const result = await ensureNotificationCanary(canarySpec, surface)
+    assert.equal(result.agent.id, surface.agent.id)
+    assert.equal(result.seat.daemon_key, 'mini:testing')
+    assert.deepEqual(surface.calls.map(call => call.type), ['check-alive', 'wake', 'check-alive'])
+  }
+})
+
+test('check-alive timeout is indeterminate provisioning while other failures remain distinct', async () => {
+  const timeout = notificationCanaryProvisioningSurface({ alive: [new Error('check-alive timed out after 15000ms')] })
+  await assert.rejects(ensureNotificationCanary(canarySpec, timeout), error =>
+    error.failureKind === 'canary-provisioning' && error.reason === 'indeterminate')
+  assert.equal(reachedConsumption(timeout.calls), false)
+
+  const transportError = new Error('check-alive connection closed')
+  const other = notificationCanaryProvisioningSurface({ alive: [transportError] })
+  await assert.rejects(ensureNotificationCanary(canarySpec, other), error => error === transportError)
+
+  const daemon = notificationCanaryProvisioningSurface({ alive: [{ state: 'wedged', reason: 'process unresponsive' }] })
+  await assert.rejects(ensureNotificationCanary(canarySpec, daemon), error =>
+    error.failureKind === 'canary-provisioning' && /state=wedged reason=process unresponsive/.test(error.message))
+})
+
+test('wake refusal and wrong identity stop before notification consumption', async () => {
+  for (const wakeResult of [
+    new Error('daemon refused wake'),
+    { ok: false, error: 'refused' },
+    { ok: true, agent_id: 'fleet:different' },
+  ]) {
+    const surface = notificationCanaryProvisioningSurface({ alive: ['hibernating'], wakeResult })
+    await assert.rejects(ensureNotificationCanary(canarySpec, surface), error => error.failureKind === 'canary-provisioning')
+    assert.equal(reachedConsumption(surface.calls), false)
+  }
+})
+
+test('post-wake identity and daemon-route failures stop before notification consumption', async () => {
+  const canonical = notificationCanaryProvisioningSurface().agent
+  const liveSeat = { session_id: 'session:canary', daemon_key: 'mini:testing', terminal_capability: true }
+  const cases = [
+    { resolved: [canonical, canonical, null], seats: [liveSeat] },
+    { resolved: [canonical, canonical, { ...canonical, dead: true }], seats: [liveSeat] },
+    { resolved: [canonical, canonical, { ...canonical, id: 'fleet:different' }], seats: [liveSeat] },
+    { resolved: [canonical, canonical, canonical], seats: [liveSeat, { ...liveSeat, daemon_key: 'fly:testing' }] },
+  ]
+  for (const options of cases) {
+    const surface = notificationCanaryProvisioningSurface({ alive: ['hibernating'], ...options })
+    await assert.rejects(ensureNotificationCanary(canarySpec, surface), error =>
+      error.failureKind === 'canary-provisioning' && error.reason === 'wake-route-mismatch')
+    assert.equal(reachedConsumption(surface.calls), false)
+  }
+})
+
+test('post-wake timeout and non-alive result stop before notification consumption', async () => {
+  for (const second of [new Error('check-alive timed out after 15000ms'), 'wedged']) {
+    const surface = notificationCanaryProvisioningSurface({ alive: ['hibernating', second] })
+    await assert.rejects(ensureNotificationCanary(canarySpec, surface), error => error.failureKind === 'canary-provisioning')
+    assert.equal(reachedConsumption(surface.calls), false)
+  }
+})
+
+test('dead state for a different reason is not wakeable', async () => {
+  const surface = notificationCanaryProvisioningSurface({ alive: [{ state: 'dead', reason: 'process exited' }] })
+  await assert.rejects(ensureNotificationCanary(canarySpec, surface), error =>
+    error.failureKind === 'canary-provisioning' && /state=dead reason=process exited/.test(error.message))
+  assert.equal(surface.calls.some(call => call.type === 'wake'), false)
+  assert.equal(reachedConsumption(surface.calls), false)
 })
 
 test('runChecks carries notification failure kind into the report', async () => {
