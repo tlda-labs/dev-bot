@@ -14,6 +14,7 @@ const {
   ensureNotificationCanary,
   sendNotificationConsumptionTmuxAlarm,
   checkBotHeartbeats,
+  quietedBotNames,
   composeFailureNudgeMessage,
   failureKey,
   failureNudgeMessageReport,
@@ -770,6 +771,7 @@ test('bot health distinguishes beating, stopped, uninstrumented, and alive-but-d
       declaredBots: ['hearing', 'deaf', 'missing'],
       heartbeatDir: dir,
       now: () => now,
+      quietedNames: async () => new Set(),
     }),
     /alive but deaf/,
   )
@@ -778,10 +780,70 @@ test('bot health distinguishes beating, stopped, uninstrumented, and alive-but-d
     declaredBots: ['hearing', 'missing'],
     heartbeatDir: dir,
     now: () => now,
+    quietedNames: async () => new Set(),
   })
   assert.deepEqual(result.beating, ['hearing'])
   assert.deepEqual(result.unmonitored, ['missing'])
   assert.equal(result.blocked, true)
+})
+
+test('a bot quieted by rename is not reported as stopped, and a failed lookup still alarms', async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), 'devbot-quieted-'))
+  await mkdir(dir, { recursive: true })
+  const now = Date.now() + 20 * 60_000
+  await writeFile(path.join(dir, 'quieted.testing.heartbeat'), JSON.stringify({
+    ts: new Date().toISOString(),
+    reason: 'fleet-event',
+    lastFleetEventId: 7,
+  }) + '\n')
+
+  // Renamed away from its canonical name: inert on purpose, and the stale file it
+  // leaves behind is the same observation a crash leaves behind. Only the ledger
+  // separates them.
+  const quiet = await checkBotHeartbeats({
+    declaredBots: ['quieted'],
+    heartbeatDir: dir,
+    now: () => now,
+    quietedNames: async () => new Set(['quieted']),
+  })
+  assert.deepEqual(quiet.quieted, ['quieted'])
+  assert.deepEqual(quiet.beating, [])
+
+  // The same file, with the ledger saying nothing. An empty answer is what a
+  // broken query returns, so it must not be able to silence a real outage.
+  await assert.rejects(
+    checkBotHeartbeats({
+      declaredBots: ['quieted'],
+      heartbeatDir: dir,
+      now: () => now,
+      quietedNames: async () => new Set(),
+    }),
+    /so it stopped/,
+  )
+})
+
+test('quieted-bot classification reads the fields fleet-table actually sends', async () => {
+  // The shape below is a real `/api/fleet-table` page, trimmed. It has `name` and
+  // `status`; it has no `friendly_name` and no `dead`. Reading the absent ones
+  // makes the canonical-name test never match, which classifies every model with
+  // any living agent as quieted and silences the alarm entirely — fail-open, in a
+  // check whose whole purpose is not to be.
+  const page = [
+    { id: 'fleet:dev', name: 'quiet-dev', model: 'dev', status: 'hibernating' },
+    { id: 'fleet:dev2', name: 'quiet-dev-2', model: 'dev', status: 'hibernating' },
+    { id: 'fleet:todd', name: 'todd', model: 'todd', status: 'hibernating' },
+    { id: 'fleet:qodd', name: 'qodd', model: 'todd', status: 'hibernating' },
+  ]
+  const quieted = await quietedBotNames(['dev', 'todd'], { fetchRows: async () => page })
+  assert.deepEqual([...quieted], ['dev'])
+
+  // No agent of that model at all is no evidence either way, so it stays alarming.
+  const unknown = await quietedBotNames(['grammar'], { fetchRows: async () => page })
+  assert.deepEqual([...unknown], [])
+
+  // And a lookup that throws must not quiet anything.
+  const failed = await quietedBotNames(['dev'], { fetchRows: async () => { throw new Error('roster down') } })
+  assert.deepEqual([...failed], [])
 })
 
 test('blocked checks are carried into the sweep report', async () => {

@@ -27,7 +27,7 @@ import {
   getServerUrl,
   parseConfig,
 } from '@tlda/bot'
-import { labelsForAgent, reapIdlePreviews } from '@tlda/bot'
+import { labelsForAgent, reapIdlePreviews, surveyBotHeartbeats } from '@tlda/bot'
 import { createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
 import { checkServerImports, describeServerImportFailures } from './server-import-resolution.mjs'
 import { createGitRemoteProbeDriver, runLinkedRemoteProbe } from './linked-remote-probe.mjs'
@@ -1591,30 +1591,6 @@ async function botSenderIds() {
   return new Set(rows.map(row => row.id).filter(Boolean))
 }
 
-function readLastHeartbeatEntry(file) {
-  let content
-  try {
-    const { size } = fs.statSync(file)
-    const start = Math.max(0, size - 256 * 1024)
-    const fd = fs.openSync(file, 'r')
-    const buffer = Buffer.alloc(size - start)
-    fs.readSync(fd, buffer, 0, buffer.length, start)
-    fs.closeSync(fd)
-    content = buffer.toString('utf8')
-  } catch {
-    return null
-  }
-  for (const line of content.trimEnd().split('\n').reverse()) {
-    if (!line.trim()) continue
-    try {
-      return JSON.parse(line)
-    } catch {
-      continue
-    }
-  }
-  return null
-}
-
 // The agent's own most recent PRODUCED entry. Role 'assistant' is the point: a
 // message delivered to an agent writes a `user` entry the moment it lands, so
 // counting any entry would let the delivery itself stand as evidence that the
@@ -2008,47 +1984,87 @@ export async function checkServerImportResolution() {
 // teacher and nobody had never written one. There is no middle of that
 // distribution, so 15 minutes sits far above every healthy value and far below
 // every failing one.
+// A rename is the sanctioned bot stop, so a bot living under a name that is not
+// its own was switched off on purpose. Only the ledger records that: on disk a
+// bot somebody quieted and a bot that crashed are the same stale heartbeat file.
+//
+// Asked as POSITIVE evidence, deliberately. The obvious test -- "no living agent
+// holds the canonical name" -- is an absence, and an absence is also what a
+// broken query returns: one bad filter and every bot looks quieted and nothing
+// can ever alarm again. So a bot counts as quieted only when the roster actually
+// shows an agent OF THAT MODEL living under a different name. An empty answer
+// proves nothing and alarms, which is the safe direction.
+//
+// Keyed on the model rather than the name because that is what survives a rename
+// -- `AGENTS.md` §"One bot of a model, for its whole life". Same rule and same
+// reasoning as todd's `quietedBotNames`; the survey underneath is now literally
+// the same function.
+export async function quietedBotNames(declared, { fetchRows = fleetTableRows } = {}) {
+  if (!declared.length) return new Set()
+  let rows
+  try {
+    rows = await fetchRows(declared.map(name => `model:${name}`).join(' | '))
+  } catch (e) {
+    console.error(`[dev-bot] quieted-bot lookup failed: ${e.message}`)
+    return new Set()
+  }
+  // `/api/fleet-table` rows carry `name` and `status`. They do NOT carry
+  // `friendly_name` or `dead`, and reading those instead is not a near miss: the
+  // canonical-name test silently never matches, so every model with any living
+  // agent reads as quieted and the whole alarm goes away. Measured against the
+  // live store on 2026-09-12 — `todd` was running under its own name and would
+  // have been classified quieted. The test below holds this down.
+  const living = rows.filter(agent => agent && agent.status !== 'dead')
+  const quieted = new Set()
+  for (const name of declared) {
+    const ofModel = living.filter(agent => String(agent.model || '').toLowerCase() === name)
+    if (!ofModel.length) continue
+    if (ofModel.some(agent => String(agent.name || '').toLowerCase() === name)) continue
+    quieted.add(name)
+  }
+  return quieted
+}
+
+// This check used to carry its own copy of the survey, and the copy is what made
+// the defect survivable: todd's was fixed on 2026-09-12 and this one alarmed on
+// exactly the same false positive because nothing connected them. `@tlda/bot`
+// has exported `surveyBotHeartbeats` for both bots since it was written -- the
+// export comment says "todd, dev" -- so there is one classifier again and the
+// count of implementations goes from two to one.
+//
+// What this check does with the classification is still its own: it alarms on
+// `stopped` and `deaf`, degrades on `unmonitored`, and now reports `quieted` and
+// `undeclared` as context without alarming on either. `undeclared` is new
+// information the shared survey produces and the old copy could not see; it is
+// reported rather than alarmed on, because adding an alarm nobody asked for is a
+// separate decision from removing a false one.
 export async function checkBotHeartbeats({
   declaredBots = BOT_ENVIRONMENTS[CONFIG_NAME] || [],
   heartbeatDir = CONFIG_DIR,
   now = () => Date.now(),
+  quietedNames = quietedBotNames,
 } = {}) {
   const declared = declaredBots
     .map(name => String(name).toLowerCase())
     .filter(name => name !== BOT_KEY)
   if (!declared.length) return { skipped: true, blocked: true, reason: `no bots declared for environment ${CONFIG_NAME}` }
 
-  const currentTime = now()
-  const silent = []
-  const beating = []
-  for (const name of declared) {
-    const file = path.join(heartbeatDir, `${name}.${CONFIG_NAME}.heartbeat`)
-    let mtimeMs = null
-    let birthtimeMs = null
-    try {
-      const stat = fs.statSync(file)
-      mtimeMs = stat.mtimeMs
-      birthtimeMs = stat.birthtimeMs || stat.ctimeMs || mtimeMs
-    } catch {
-      silent.push({ name, file, never: true })
-      continue
-    }
-    const last = readLastHeartbeatEntry(file)
-    const hasHearingField = last && Object.hasOwn(last, 'lastFleetEventId')
-    if (hasHearingField && Number(last.lastFleetEventId) === 0 && currentTime - birthtimeMs >= BOT_HEARTBEAT_STALE_MS) {
-      silent.push({
-        name,
-        file,
-        deaf: true,
-        staleMin: Math.round((currentTime - birthtimeMs) / 60_000),
-        reason: last.reason || null,
-      })
-      continue
-    }
-    const staleMs = currentTime - mtimeMs
-    if (staleMs >= BOT_HEARTBEAT_STALE_MS) silent.push({ name, file, staleMin: Math.round(staleMs / 60_000) })
-    else beating.push(name)
-  }
+  const quieted = await quietedNames(declared)
+  const survey = surveyBotHeartbeats({
+    declaredBots: declared,
+    heartbeatDir,
+    envName: CONFIG_NAME,
+    staleMs: BOT_HEARTBEAT_STALE_MS,
+    exclude: [BOT_KEY],
+    isQuieted: name => quieted.has(name),
+    now,
+  })
+
+  const stopped = survey.stopped || []
+  const deaf = survey.deaf || []
+  const quietedRows = survey.quieted || []
+  const undeclared = survey.undeclared || []
+  const unmonitored = (survey.unmonitored || []).map(entry => entry.name)
 
   // "Stopped writing" and "never written" are different facts and reporting them
   // in one sentence made them look alike. `grammar` HAD a heartbeat and lost it,
@@ -2063,9 +2079,6 @@ export async function checkBotHeartbeats({
   // the row silenced, and silencing it would record that a declared bot has no
   // liveness instrument as though it were fine -- teacher is the bot Skip asked
   // for by name this afternoon, and its being unmonitorable is worth knowing.
-  const stopped = silent.filter(entry => !entry.never && !entry.deaf)
-  const deaf = silent.filter(entry => entry.deaf)
-  const unmonitored = silent.filter(entry => entry.never).map(entry => entry.name)
   if (stopped.length || deaf.length) {
     const lines = [
       ...stopped.map(entry =>
@@ -2073,11 +2086,16 @@ export async function checkBotHeartbeats({
       ...deaf.map(entry =>
         `**${entry.name}** is declared for \`${CONFIG_NAME}\` and has written heartbeats for ${entry.staleMin} minutes without hearing a fleet event (\`${entry.file}\`, last reason: ${entry.reason || 'unknown'}). It is alive but deaf.`),
     ]
-    throw new Error(lines.join('\n\n') + `\n\nBeating: ${beating.length ? beating.join(', ') : 'none'}. Either restore the bot's fleet hearing, start it, or stop declaring it in \`bots.yaml\`; those clear this.`)
+    if (quietedRows.length) {
+      lines.push(`Quieted on purpose, not a fault: ${quietedRows.map(entry => entry.name).join(', ')} — renamed away from the canonical name, so inert by design.`)
+    }
+    throw new Error(lines.join('\n\n') + `\n\nBeating: ${survey.beating.length ? survey.beating.join(', ') : 'none'}. Either restore the bot's fleet hearing, start it, or stop declaring it in \`bots.yaml\`; those clear this.`)
   }
   return {
     declared: declared.length,
-    beating,
+    beating: survey.beating,
+    ...(quietedRows.length ? { quieted: quietedRows.map(entry => entry.name) } : {}),
+    ...(undeclared.length ? { undeclared: undeclared.map(entry => entry.name) } : {}),
     ...(unmonitored.length ? { unmonitored, blocked: true, reason: `declared with no heartbeat instrument: ${unmonitored.join(', ')}` } : {}),
   }
 }
