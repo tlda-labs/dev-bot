@@ -55,6 +55,13 @@ const ALLOWED_ENVIRONMENTS = Object.entries(BOT_ENVIRONMENTS)
 const positive = value => value > 0
 export const configSchema = defineConfig({
   intervalMs: { env: 'TLDA_DEV_BOT_INTERVAL_MS', default: 60_000, description: 'Behavioral probe interval in milliseconds.', parse: configTypes.integer, validate: positive },
+  // Holding one check out is not the same as deleting it. A name here stops that
+  // check running and lands it in the sweep's `missing` list, so the heartbeat
+  // reads `degraded` rather than `healthy` for exactly as long as it is held out
+  // -- the same treatment a check removed from the table gets. That is the point:
+  // the alternative to a named, visible hold-out is shelving the whole bot, and
+  // shelving the whole bot is what cost 32 hours of blindness.
+  disabledChecks: { env: 'TLDA_DEV_BOT_DISABLED_CHECKS', default: '', description: 'Comma-separated check names to hold out of the sweep. Held-out checks report the sweep as degraded, never healthy.', parse: configTypes.string },
   failureCooldownMs: { env: 'TLDA_DEV_BOT_FAILURE_COOLDOWN_MS', default: 300_000, description: 'Minimum interval between identical failure notices.', parse: configTypes.integer, validate: positive },
   requestTimeoutMs: { env: 'TLDA_DEV_BOT_REQUEST_TIMEOUT_MS', default: 15_000, description: 'Fleet and HTTP request timeout in milliseconds.', parse: configTypes.integer, validate: positive },
   spawnWakeIntervalMs: { env: 'TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS', default: 1_800_000, description: 'Spawn/wake probe cadence in milliseconds.', parse: configTypes.integer, validate: positive },
@@ -101,6 +108,7 @@ export const configSchema = defineConfig({
 const config = parseConfig(configSchema)
 const {
   intervalMs: INTERVAL_MS, failureCooldownMs: FAILURE_COOLDOWN_MS, requestTimeoutMs: REQUEST_TIMEOUT_MS,
+  disabledChecks: DISABLED_CHECKS_RAW,
   spawnWakeIntervalMs: SPAWN_WAKE_INTERVAL_MS, spawnWakeTimeoutMs: SPAWN_WAKE_TIMEOUT_MS,
   spawnWakeEnabled: SPAWN_WAKE_ENABLED, spawnWakeModel: SPAWN_WAKE_MODEL, probeDoc: PROBE_DOC,
   notificationConsumptionTimeoutMs: NOTIFICATION_CONSUMPTION_TIMEOUT_MS,
@@ -2182,7 +2190,15 @@ export async function checkResourceCleanup({
   }
 }
 
-function defaultChecks() {
+export const DISABLED_CHECKS = new Set(
+  String(DISABLED_CHECKS_RAW || '').split(',').map(name => name.trim()).filter(Boolean),
+)
+
+export function defaultChecks() {
+  return allChecks().filter(([name]) => !DISABLED_CHECKS.has(name))
+}
+
+export function allChecks() {
   return [
     ['doc-load', checkDocumentLoads],
     ['doc-render', checkDocumentRenders],

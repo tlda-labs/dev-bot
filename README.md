@@ -58,12 +58,16 @@ The runtime validator and this section use the same schema.
 
 <!-- BEGIN GENERATED CONFIG -->
 - `TLDA_DEV_BOT_INTERVAL_MS` (intervalMs; default: `60000`) — Behavioral probe interval in milliseconds.
+- `TLDA_DEV_BOT_DISABLED_CHECKS` (disabledChecks; default: `""`) — Comma-separated check names to hold out of the sweep. Held-out checks report the sweep as degraded, never healthy.
 - `TLDA_DEV_BOT_FAILURE_COOLDOWN_MS` (failureCooldownMs; default: `300000`) — Minimum interval between identical failure notices.
 - `TLDA_DEV_BOT_REQUEST_TIMEOUT_MS` (requestTimeoutMs; default: `15000`) — Fleet and HTTP request timeout in milliseconds.
 - `TLDA_DEV_BOT_SPAWN_WAKE_INTERVAL_MS` (spawnWakeIntervalMs; default: `1800000`) — Spawn/wake probe cadence in milliseconds.
 - `TLDA_DEV_BOT_SPAWN_WAKE_TIMEOUT_MS` (spawnWakeTimeoutMs; default: `180000`) — Overall spawn/wake probe deadline.
 - `TLDA_DEV_BOT_SPAWN_WAKE_ENABLED` (spawnWakeEnabled; default: `false`) — Whether the mutating disposable core phi probe runs after shadow verification.
 - `TLDA_DEV_BOT_SPAWN_WAKE_MODEL` (spawnWakeModel; default: `""`) — Optional model override for the disposable probe agent.
+- `TLDA_DEV_BOT_NOTIFICATION_CONSUMPTION_TIMEOUT_MS` (notificationConsumptionTimeoutMs; default: `120000`) — Deadline for live Claude/Codex notification canaries to consume and acknowledge a probe message.
+- `TLDA_DEV_BOT_NOTIFICATION_CONSUMPTION_CLAUDE_MODEL` (notificationConsumptionClaudeModel; default: `"opus"`) — Claude-family model alias used for the standing notification-consumption canary.
+- `TLDA_DEV_BOT_NOTIFICATION_CONSUMPTION_CODEX_MODEL` (notificationConsumptionCodexModel; default: `"terra"`) — Codex-family model alias used for the standing notification-consumption canary.
 - `TLDA_DEV_BOT_LINKED_REMOTE_ENABLED` (linkedRemoteEnabled; default: `false`) — Whether to exercise the disposable linked Git remote.
 - `TLDA_DEV_BOT_LINKED_REMOTE_INTERVAL_MS` (linkedRemoteIntervalMs; default: `1800000`) — Linked remote safety probe cadence in milliseconds.
 - `TLDA_DEV_BOT_LINKED_REMOTE_URL` (linkedRemoteUrl; default: `""`) — Reachable disposable Git remote URL used instead of the local Git daemon fixture.

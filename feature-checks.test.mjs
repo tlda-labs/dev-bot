@@ -5,6 +5,9 @@ import path from 'node:path'
 import test from 'node:test'
 
 process.env.TLDA_DEV_BOT_NO_START = '1'
+// Set before the import below: `DISABLED_CHECKS` is read out of the environment
+// once, at module load, the same as every other key in the config schema.
+process.env.TLDA_DEV_BOT_DISABLED_CHECKS = 'doc-render,mcp-surface'
 const {
   checkMessageRoundTrip,
   checkDocumentRenders,
@@ -21,6 +24,9 @@ const {
   checkMisconfiguredAgents,
   checkResourceCleanup,
   runChecks,
+  allChecks,
+  defaultChecks,
+  DISABLED_CHECKS,
 } = await import('./dev-bot.mjs')
 
 function fakeProbeConnection({ chatResult = { event_ids: [42] } } = {}) {
@@ -844,6 +850,30 @@ test('quieted-bot classification reads the fields fleet-table actually sends', a
   // And a lookup that throws must not quiet anything.
   const failed = await quietedBotNames(['dev'], { fetchRows: async () => { throw new Error('roster down') } })
   assert.deepEqual([...failed], [])
+})
+
+test('a held-out check does not run, and holding it out does not delete it', () => {
+  // `bots.yaml` has named seven checks here since 2026-08-23, three of them the
+  // probe checks that mint a live agent per sweep. The mechanism that reads the
+  // name was written on 2026-08-18 and never landed on this line, so the file
+  // has been describing a hold-out that never happened. This is that mechanism,
+  // and this is the assertion that it is wired to something.
+  assert.deepEqual([...DISABLED_CHECKS].sort(), ['doc-render', 'mcp-surface'])
+
+  const all = allChecks().map(([name]) => name)
+  const swept = defaultChecks().map(([name]) => name)
+
+  // Held out of the sweep...
+  assert.ok(!swept.includes('doc-render'))
+  assert.ok(!swept.includes('mcp-surface'))
+  // ...but not deleted. A held-out check still exists, which is what lands it in
+  // `missing` and holds the heartbeat at `degraded` rather than `healthy`.
+  assert.ok(all.includes('doc-render'))
+  assert.ok(all.includes('mcp-surface'))
+
+  // Nothing else is affected, and the sweep is not empty.
+  assert.deepEqual(swept, all.filter(name => name !== 'doc-render' && name !== 'mcp-surface'))
+  assert.ok(swept.length > 0)
 })
 
 test('blocked checks are carried into the sweep report', async () => {
