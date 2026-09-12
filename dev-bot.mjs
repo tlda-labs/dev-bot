@@ -2333,6 +2333,8 @@ async function sendChat(to, message) {
 
 function normalizeFailureReason(text) {
   return String(text || '')
+    .replace(/\b(devbot-(?:render|materialize)-)[a-f0-9]+/gi, '$1#')
+    .replace(/\b(fleet:(?:dev|mcp)-probe-)[a-f0-9]+/gi, '$1#')
     .replace(/`[^`]+`/g, '`#`')
     .replace(/\d+/g, '#')
     .replace(/\s+/g, ' ')

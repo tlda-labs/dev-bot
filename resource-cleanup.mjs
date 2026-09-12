@@ -1,12 +1,102 @@
 import { execFile } from 'child_process'
-import { rm, stat } from 'fs/promises'
+import { readdir, readFile, rm, stat } from 'fs/promises'
+import { homedir } from 'os'
 import path from 'path'
 import { promisify } from 'util'
 import { fileURLToPath } from 'url'
+import { classifyWorktreeIgnored, IGNORED_STATUS_ARGS } from '@tlda/bot'
 
 const execFileP = promisify(execFile)
 const MAIN_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tlda')
 export const DEFAULT_WORKTREE_NODE_MODULES_BUDGET_BYTES = 50 * 1024 ** 3
+export const PLAYWRIGHT_SWEEP_TIMEOUT_MS = 120_000
+export const PLAYWRIGHT_REAP_TIMEOUT_MS = PLAYWRIGHT_SWEEP_TIMEOUT_MS
+
+// Two minutes. These files are the LOSING half of a copy-then-rename, so a
+// blanket delete can catch one that is about to be renamed into place and break
+// a live `git`. Anything this old lost its race long ago.
+export const DEFAULT_XCRUN_CACHE_MIN_AGE_MS = 2 * 60_000
+
+// The real per-user temp directory, which is NOT `process.env.TMPDIR` here.
+//
+// dev runs under the fence, which rewrites TMPDIR to `/tmp/tlda-fence-env`. The
+// xcrun cache lives in the per-user Darwin temp dir regardless, so a sweep
+// written as `find $TMPDIR` inspects an empty directory, deletes nothing, and
+// reports success -- the reports-success-while-doing-nothing class that this
+// whole incident was made of. `getconf` answers for the user, not the process
+// environment, so it is right under the fence and right outside it.
+//
+// Resolved per sweep rather than at import for the same reason `xcrun --find`
+// beats a hardcoded path: it stays correct if the answer changes, and once per
+// ten minutes is not a cost.
+async function defaultUserTempDir(run) {
+  const { stdout } = await run('getconf', ['DARWIN_USER_TEMP_DIR'], { timeout: 10_000, encoding: 'utf8' })
+  const resolved = stdout.trim()
+  if (!resolved) throw new Error('getconf DARWIN_USER_TEMP_DIR returned nothing')
+  return resolved
+}
+
+// `/usr/bin/git` is the Xcode shim: every call consults a ~92 MB xcrun cache
+// database, written copy-then-rename. Concurrent callers race, and each loser
+// leaves its copy behind -- measured at ~44 MiB per git call at concurrency 8,
+// ~400 MiB/min with the fleet at full tilt, which is a full volume overnight.
+//
+// This reclaims the orphans. It does not stop them being made; that is the
+// resolve-once change to how the fleet invokes git, which touches agent launch.
+export function createXcrunCacheCleanup({
+  run = execFileP,
+  minAgeMs = DEFAULT_XCRUN_CACHE_MIN_AGE_MS,
+  tempDir = () => defaultUserTempDir(run),
+  listEntries = readdir,
+  readStat = stat,
+  removeFile = target => rm(target, { force: true }),
+  now = () => Date.now(),
+} = {}) {
+  async function sweep() {
+    const dir = await tempDir()
+    const entries = await listEntries(dir)
+    // `xcrun_db-` WITH the trailing dash, and the dash is the whole safety
+    // margin. The live cache is the file named exactly `xcrun_db`; the orphans
+    // are `xcrun_db-<suffix>` copies of it. A `startsWith('xcrun_db')` filter
+    // matches the live one too and deletes a ~92 MB database the entire fleet's
+    // git calls depend on -- which would then be rebuilt by whichever callers
+    // raced next, i.e. this sweep would manufacture the storm it exists to
+    // clean. It survives only because its mtime is refreshed constantly; the
+    // first quiet spell longer than the age window is when it would go.
+    const candidates = entries.filter(name => name.startsWith('xcrun_db-'))
+    const cutoff = now() - minAgeMs
+    let removed = 0
+    let removedBytes = 0
+    let retained = 0
+    let retainedBytes = 0
+    const errors = []
+    for (const name of candidates) {
+      const target = path.join(dir, name)
+      try {
+        const metadata = await readStat(target)
+        if (!metadata.isFile()) continue
+        if (metadata.mtimeMs >= cutoff) {
+          // Inside the rename window. Not an error and not a failure to
+          // reclaim -- it is the margin that makes this safe to run on a busy
+          // box, and it is reported so the total never looks like a shortfall.
+          retained += 1
+          retainedBytes += metadata.size
+          continue
+        }
+        await removeFile(target)
+        removed += 1
+        removedBytes += metadata.size
+      } catch (error) {
+        // A file that vanished between readdir and stat is the normal case on a
+        // directory this hot, not a fault.
+        if (error?.code === 'ENOENT') continue
+        errors.push(`${name}: ${error?.message || 'failed'}`)
+      }
+    }
+    return { dir, removed, removedBytes, retained, retainedBytes, errors }
+  }
+  return { sweep }
+}
 
 function containsPath(parent, child) {
   const relative = path.relative(parent, child)
@@ -74,13 +164,27 @@ export function createWorktreeCleanup({
     const isActive = worktree => [...activeCwds].some(cwd => containsPath(worktree.path, cwd))
     const removedWorktrees = []
     const removable = []
+    const keptForContent = []
     const pinned = []
     const abandoned = []
     const unremovable = []
+    // Coverage, because the output looked like coverage and was not. This sweep
+    // sends most worktrees past classification on a `continue`, and it logged a
+    // line per classified worktree with nothing saying how many it never
+    // reached. On 2026-08-18 someone read an hour of its accumulated log lines
+    // as a census and reported 173 worktrees vetted as removable; it had
+    // examined 21. app-lockup had already measured 401 of 404 never reaching
+    // classifyWorktreeIgnored, and the two numbers sat in one thread without
+    // being put side by side.
+    //
+    // A check reports what it observed and names what it did not. Silence about
+    // the skipped majority is what let a true count become a false claim.
+    const skipped = { dirty: 0, unmergedByAncestry: 0, active: 0, unreadable: 0 }
 
     for (const worktree of worktrees.filter(entry => entry.path !== main)) {
       if (isActive(worktree)) {
         pinned.push({ ...worktree, reason: 'live-process' })
+        skipped.active += 1
         continue
       }
       let status
@@ -91,16 +195,29 @@ export function createWorktreeCleanup({
         })
       } catch (error) {
         abandoned.push({ ...worktree, error: error?.stderr?.trim() || error?.message || String(error) })
+        skipped.unreadable += 1
         continue
       }
-      if ((status.stdout || '').trim()) continue
+      if ((status.stdout || '').trim()) {
+        skipped.dirty += 1
+        continue
+      }
       try {
         await run('git', ['-C', repoRoot, 'merge-base', '--is-ancestor', worktree.head, 'main'], {
           timeout: 10_000,
           encoding: 'utf8',
         })
       } catch (error) {
-        if (error?.code === 1) continue
+        // Exit 1 means "not an ancestor of main". On this repo that is mostly
+        // meaningless -- main is assembled by cherry-pick, so a landed change
+        // exists as two shas and the author's is never an ancestor. See
+        // AGENTS.md "main is assembled by cherry-pick". This is the single
+        // biggest reason worktrees never get classified, and it is counted
+        // rather than silent so the coverage gap is visible in the result.
+        if (error?.code === 1) {
+          skipped.unmergedByAncestry += 1
+          continue
+        }
         throw error
       }
       // STOP-LOSS: classify, record, and do NOT remove.
@@ -114,16 +231,42 @@ export function createWorktreeCleanup({
       // worktrees, the one containing only a gitignored plan was removed and the
       // plan was gone; modified-tracked and untracked-source worktrees survived.
       //
-      // Removal is off until the predicate can tell ignored BUILD CACHE (which is
-      // reclaimable) from ignored AGENT CONTENT (which is someone's work). That is
-      // a product question about what this sweep is for, and it is Skip's.
+      // The predicate that was missing now exists. Skip, 2026-08-13, on what this
+      // sweep is for: "I thought they were supposed to fucking remove node modules
+      // and shit", and on it taking `scratch/`: "That's fucked." So ignored build
+      // output is reclaimable, ignored authored content is not, and anything
+      // nobody has classified counts as authored — the default fails toward
+      // keeping, because the cost of being wrong is a file whose only copy lived
+      // in the directory AGENTS.md tells agents to write to.
       //
-      // Recording the decision is the point: the old path logged only failures, so
-      // there was no record of what it took and the question could not be answered
-      // afterwards. Everything else this sweep does — node_modules eviction, the pw
-      // pool, preview reaping — is untouched.
-      removable.push({ ...worktree, reason: 'clean per `status --porcelain` (ignored files invisible) and head is an ancestor of main' })
-      console.log(`[worktree-cleanup] WOULD REMOVE ${worktree.path} branch=${worktree.branch || '(detached)'} head=${worktree.head || '?'} — removal disabled pending predicate`)
+      // Classifying each ignored entry rather than the worktree is what keeps the
+      // sweep alive: every worktree has `node_modules`, so "any ignored file
+      // protects it" would disable cleanup entirely.
+      //
+      // REMOVAL STAYS OFF. Landing a predicate and re-enabling removal in one
+      // change is how a safe fix becomes a destructive one, and turning it back
+      // on is Skip's decision. What changes here is that the log now says which
+      // way the predicate went, so the question "would this have taken anything
+      // of mine" has an answer before anyone flips it.
+      let ignoredStatus = ''
+      try {
+        const result = await run('git', ['-C', worktree.path, ...IGNORED_STATUS_ARGS], { timeout: 20_000, encoding: 'utf8' })
+        ignoredStatus = result.stdout || ''
+      } catch (error) {
+        // Unreadable ignored state is not permission to delete. Treat it as
+        // authored and say so.
+        keptForContent.push({ ...worktree, reason: `ignored status unreadable: ${error?.message || error}` })
+        console.log(`[worktree-cleanup] KEEP ${worktree.path} — cannot read ignored state, treating as authored`)
+        continue
+      }
+      const verdict = classifyWorktreeIgnored(ignoredStatus)
+      if (!verdict.safeToRemove) {
+        keptForContent.push({ ...worktree, reason: 'holds authored content', authored: verdict.authored.map(entry => entry.path) })
+        console.log(`[worktree-cleanup] KEEP ${worktree.path} branch=${worktree.branch || '(detached)'} — authored content: ${verdict.authored.slice(0, 5).map(entry => entry.path).join(', ')}${verdict.authored.length > 5 ? `, +${verdict.authored.length - 5} more` : ''}`)
+        continue
+      }
+      removable.push({ ...worktree, reason: 'clean per `status --porcelain`, and every ignored entry is build output' })
+      console.log(`[worktree-cleanup] WOULD REMOVE ${worktree.path} branch=${worktree.branch || '(detached)'} head=${worktree.head || '?'} — only build output (${verdict.reclaimable.map(entry => entry.path).slice(0, 5).join(', ') || 'nothing ignored'}); removal still disabled`)
     }
 
     const remaining = worktrees.filter(worktree =>
@@ -138,6 +281,12 @@ export function createWorktreeCleanup({
         if (error?.code !== 'ENOENT') throw error
       }
     }
+    // One line per sweep saying what it did NOT look at. Without it the
+    // per-worktree lines above are the only output, and a reader counting them
+    // is counting the tiny minority that survived four `continue`s.
+    const skippedTotal = skipped.dirty + skipped.unmergedByAncestry + skipped.active + skipped.unreadable
+    console.log(`[worktree-cleanup] coverage: examined ${removable.length + keptForContent.length} of ${removable.length + keptForContent.length + skippedTotal} — skipped ${skipped.unmergedByAncestry} not-ancestor-of-main, ${skipped.dirty} dirty, ${skipped.active} in use, ${skipped.unreadable} unreadable. Not examined is NOT reclaimable.`)
+
     const measured = await measureNodeModules(withNodeModules)
     const totalBytes = measured.reduce((sum, entry) => sum + entry.sizeBytes, 0)
     let retainedBytes = totalBytes
@@ -158,6 +307,9 @@ export function createWorktreeCleanup({
       pinned,
       abandoned,
       unremovable,
+      examined: removable.length + keptForContent.length,
+      skipped,
+      skippedTotal: skipped.dirty + skipped.unmergedByAncestry + skipped.active + skipped.unreadable,
       removedWorktrees,
       removable,
     }
@@ -179,35 +331,152 @@ function hasClaimedTab(output) {
   return /pwtab=[a-zA-Z0-9_.-]+/.test(output)
 }
 
+function withinDeadline(promise, timeoutMs, label, onTimeout = () => {}) {
+  let timer
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label} did not settle within ${timeoutMs}ms`))
+      onTimeout()
+    }, timeoutMs)
+  })
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
+}
+
+async function lastPlaywrightTouch(session, touchDir = path.join(homedir(), '.config', 'tlda', 'pw-touch')) {
+  let files
+  try {
+    files = await readdir(touchDir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return { known: true, at: null }
+    return { known: false, at: null }
+  }
+  let latest = null
+  for (const file of files.filter(name => name.endsWith('.json'))) {
+    try {
+      const record = JSON.parse(await readFile(path.join(touchDir, file), 'utf8'))
+      if (record?.session === session && Number.isFinite(record.ts)) {
+        latest = Math.max(latest || 0, record.ts)
+      }
+    } catch {
+      // A corrupt record could belong to this session. Preserve the browser.
+      return { known: false, at: null }
+    }
+  }
+  return { known: true, at: latest }
+}
+
 export function createPlaywrightPoolCleanup({
   run = execFileP,
   now = () => Date.now(),
   baseSession = process.env.TLDA_PW_BASE_SESSION || 'shared',
   capacity = Math.max(1, parseInt(process.env.TLDA_PW_CAPACITY || '', 10) || 3),
   emptyIdleMs = parseInt(process.env.TLDA_DEV_BOT_PW_EMPTY_MS || '', 10) || 5 * 60_000,
+  unhealthyIdleMs = parseInt(process.env.TLDA_DEV_BOT_PW_UNHEALTHY_MS || '', 10) || 5 * 60_000,
   // `playwright-cli list` measured at 11.6s / 13.1s / 15.3s on the Mini — and that
   // is the run that reports "(no browsers)", so it is the command's own floor, not
   // load. The previous 5s could never be met, so every pass errored and this half
   // of the reaper never swept anything.
   queryTimeoutMs = parseInt(process.env.TLDA_DEV_BOT_PW_QUERY_MS || '', 10) || 30_000,
+  reapTimeoutMs = PLAYWRIGHT_REAP_TIMEOUT_MS,
   playwrightCli = process.env.PLAYWRIGHT_CLI_BIN || path.join(MAIN_REPO, 'node_modules/.bin/playwright-cli'),
   tldaDev = process.env.TLDA_DEV_BIN || path.join(MAIN_REPO, 'cli/tlda-dev.mjs'),
+  readLastTouch = session => lastPlaywrightTouch(session),
 } = {}) {
   const emptySince = new Map()
+  const unhealthySince = new Map()
+  let inventoryInFlight = null
+
+  async function reap(session) {
+    const env = { ...process.env, TLDA_PW_SESSION: session }
+    try {
+      await run(tldaDev, ['pw', 'reap'], {
+        timeout: reapTimeoutMs,
+        killSignal: 'SIGKILL',
+        encoding: 'utf8',
+        env,
+      })
+      return null
+    } catch (error) {
+      const facts = [
+        `timeout=${reapTimeoutMs}ms`,
+        `killed=${error?.killed === true}`,
+        `signal=${error?.signal || 'none'}`,
+        `code=${error?.code ?? 'none'}`,
+      ].join(', ')
+      return `${error?.message || String(error)} (${facts})`
+    }
+  }
+
+  function inventory() {
+    if (inventoryInFlight) return inventoryInFlight
+    const controller = new AbortController()
+    const owned = { controller, promise: null }
+    owned.promise = Promise.resolve().then(() => run(playwrightCli, ['list'], {
+      timeout: queryTimeoutMs,
+      encoding: 'utf8',
+      cwd: MAIN_REPO,
+      signal: controller.signal,
+    })).finally(() => {
+      if (inventoryInFlight === owned) inventoryInFlight = null
+    })
+    inventoryInFlight = owned
+    return owned
+  }
+
+  async function noteUnhealthy(session, error) {
+    const observedAt = now()
+    if (!unhealthySince.has(session)) unhealthySince.set(session, observedAt)
+    const idleMs = observedAt - unhealthySince.get(session)
+    if (idleMs < unhealthyIdleMs) {
+      return { session, state: 'error', error: error?.message || String(error), idleMs }
+    }
+
+    const touch = await readLastTouch(session)
+    if (!touch.known || (touch.at !== null && observedAt - touch.at < unhealthyIdleMs)) {
+      return {
+        session,
+        state: 'error',
+        error: `${error?.message || String(error)}; local ownership is ${touch.known ? 'recently active' : 'unreadable'}, preserving browser`,
+        idleMs,
+      }
+    }
+
+    const reapError = await reap(session)
+    if (reapError) {
+      return {
+        session,
+        state: 'error',
+        error: `persistently unhealthy (${error?.message || String(error)}); reap failed: ${reapError}`,
+        idleMs,
+      }
+    }
+    unhealthySince.delete(session)
+    emptySince.delete(session)
+    return { session, state: 'reaped', reason: 'persistently-unhealthy', idleMs }
+  }
 
   async function sweepSession(session, listOutput) {
     const env = { ...process.env, TLDA_PW_SESSION: session }
     if (!sessionIsOpen(listOutput, session)) {
       emptySince.delete(session)
+      unhealthySince.delete(session)
       return { session, state: 'down' }
     }
 
-    await run(tldaDev, ['pw', 'sweep'], { timeout: 20_000, encoding: 'utf8', env })
-    const tabs = await run(playwrightCli, [`-s=${session}`, 'tab-list'], {
-      timeout: queryTimeoutMs,
-      encoding: 'utf8',
-      cwd: MAIN_REPO,
-    })
+    let tabs
+    try {
+      // Match tlda-dev's own measured loaded-machine verb budget. Killing this
+      // wrapper at 20s turns a slow, healthy sweep into a recurring Dev red.
+      await run(tldaDev, ['pw', 'sweep'], { timeout: PLAYWRIGHT_SWEEP_TIMEOUT_MS, encoding: 'utf8', env })
+      tabs = await run(playwrightCli, [`-s=${session}`, 'tab-list'], {
+        timeout: queryTimeoutMs,
+        encoding: 'utf8',
+        cwd: MAIN_REPO,
+      })
+      unhealthySince.delete(session)
+    } catch (error) {
+      return noteUnhealthy(session, error)
+    }
     if (hasClaimedTab(tabs.stdout || '')) {
       emptySince.delete(session)
       return { session, state: 'claimed' }
@@ -218,7 +487,8 @@ export function createPlaywrightPoolCleanup({
     const idleMs = observedAt - emptySince.get(session)
     if (idleMs < emptyIdleMs) return { session, state: 'empty', idleMs }
 
-    await run(tldaDev, ['pw', 'reap'], { timeout: 20_000, encoding: 'utf8', env })
+    const reapError = await reap(session)
+    if (reapError) throw new Error(`reap failed: ${reapError}`)
     emptySince.delete(session)
     return { session, state: 'reaped', idleMs }
   }
@@ -227,11 +497,13 @@ export function createPlaywrightPoolCleanup({
     const results = []
     let listOutput
     try {
-      const list = await run(playwrightCli, ['list'], {
-        timeout: queryTimeoutMs,
-        encoding: 'utf8',
-        cwd: MAIN_REPO,
-      })
+      const operation = inventory()
+      const list = await withinDeadline(
+        operation.promise,
+        queryTimeoutMs,
+        'Playwright inventory',
+        () => operation.controller.abort(),
+      )
       listOutput = list.stdout || ''
     } catch (error) {
       return poolSessions(baseSession, capacity).map(session => ({
@@ -244,7 +516,7 @@ export function createPlaywrightPoolCleanup({
       try {
         results.push(await sweepSession(session, listOutput))
       } catch (error) {
-        results.push({ session, state: 'error', error: error?.message || String(error) })
+        results.push(await noteUnhealthy(session, error))
       }
     }
     return results

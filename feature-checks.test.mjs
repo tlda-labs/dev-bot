@@ -278,6 +278,23 @@ test('failure key gives each subject in one check its own identity', () => {
   assert.match(combined, /misconfigured-agents:fleet:37723d98:/)
 })
 
+test('failure key ignores disposable probe identities', () => {
+  const first = [
+    'doc-render: GET /api/projects/devbot-render-32c89339-markdown/source-authority returned HTTP 404 {"error":"Not found"}',
+    'chat-roundtrip: Agent login for "fleet:dev-probe-b426b149" requires daemon route information.',
+    'mcp-surface: Agent login for "fleet:mcp-probe-63cc528e" requires daemon route information.',
+    'file-materialization: GET /api/projects/devbot-materialize-8fadd543/source-authority returned HTTP 404 {"error":"Not found"}',
+  ].join('\n')
+  const later = [
+    'doc-render: GET /api/projects/devbot-render-68759441-markdown/source-authority returned HTTP 404 {"error":"Not found"}',
+    'chat-roundtrip: Agent login for "fleet:dev-probe-4d41cbf5" requires daemon route information.',
+    'mcp-surface: Agent login for "fleet:mcp-probe-ecd104d2" requires daemon route information.',
+    'file-materialization: GET /api/projects/devbot-materialize-c553ca0c/source-authority returned HTTP 404 {"error":"Not found"}',
+  ].join('\n')
+
+  assert.equal(failureKey(first), failureKey(later))
+})
+
 test('new sibling failure notice still reports standing sections as ongoing', () => {
   const standing = [
     'agent-receiving: **task-notify-and-timers** (`fleet:67508f59`) has produced nothing for 126 minutes.',
