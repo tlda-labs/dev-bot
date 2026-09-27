@@ -101,6 +101,12 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_DAEMON_MINT_DB` (daemonMintDb; default: `"/Users/skip/.config/tlda/daemon-mints.sqlite"`) — Local daemon mint store, read to detect incomplete async agent joins.
 - `TLDA_DEV_BOT_DAEMON_LEDGER_DB` (daemonLedgerDb; default: `"/Users/skip/.config/tlda/fleet-daemon.db"`) — Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.
 - `TLDA_DEV_BOT_ROSTER_TIMEOUT_MS` (rosterTimeoutMs; default: `90000`) — Timeout for a whole-roster read, which is far slower than an ordinary fleet request.
+- `TLDA_DEV_BOT_BOX_MEMORY_SWAPOUT_WINDOW_MS` (boxMemorySwapoutWindowMs; default: `600000`) — Trailing window for the box-memory swapout rate.
+- `TLDA_DEV_BOT_BOX_MEMORY_SWAPOUT_RATE_PER_S` (boxMemorySwapoutRatePerS; default: `100`) — Swapout pages/s at or above which the box-memory swap leg trips.
+- `TLDA_DEV_BOT_BOX_MEMORY_TOP_N` (boxMemoryTopN; default: `5`) — Top-N RSS entries carried per box-memory sample.
+- `TLDA_DEV_BOT_BOX_MEMORY_CLIMB_SAMPLES` (boxMemoryClimbSamples; default: `3`) — Trailing readings per pid for the box-memory climber leg.
+- `TLDA_DEV_BOT_BOX_MEMORY_CLIMB_RATE_MB_PER_MIN` (boxMemoryClimbRateMbPerMin; default: `850`) — Per-process growth MB/min that trips the box-memory climber leg.
+- `TLDA_DEV_BOT_BOX_MEMORY_REAP_CLIMBERS` (boxMemoryReapClimbers; default: `false`) — Whether the climber leg reaps verified climbing renderers. Detection and alerting run regardless.
 <!-- END GENERATED CONFIG -->
 
 The shared harness also honors `TLDA_BOT_NAME`, `TLDA_BOT_PIDFILE`,

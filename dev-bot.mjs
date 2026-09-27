@@ -28,7 +28,8 @@ import {
   parseConfig,
 } from '@tlda/bot'
 import { labelsForAgent, reapIdlePreviews, surveyBotHeartbeats } from '@tlda/bot'
-import { createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
+import { BoxMemorySetupError, collectSample as collectBoxMemorySample, createBoxMemoryWatch, formatExcursionNotice } from './box-memory.mjs'
+import { createClimberReaper, createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
 import { checkServerImports, describeServerImportFailures } from './server-import-resolution.mjs'
 import { createGitRemoteProbeDriver, runLinkedRemoteProbe } from './linked-remote-probe.mjs'
 
@@ -104,6 +105,12 @@ export const configSchema = defineConfig({
   daemonMintDb: { env: 'TLDA_DEV_BOT_DAEMON_MINT_DB', default: path.join(CONFIG_DIR, 'daemon-mints.sqlite'), description: 'Local daemon mint store, read to detect incomplete async agent joins.', parse: configTypes.string },
   daemonLedgerDb: { env: 'TLDA_DEV_BOT_DAEMON_LEDGER_DB', default: path.join(CONFIG_DIR, 'fleet-daemon.db'), description: 'Daemon permission_grants ledger, read to say whether a silent agent can be placed by the daemon at all.', parse: configTypes.string },
   rosterTimeoutMs: { env: 'TLDA_DEV_BOT_ROSTER_TIMEOUT_MS', default: 90_000, description: 'Timeout for a whole-roster read, which is far slower than an ordinary fleet request.', parse: configTypes.integer, validate: positive },
+  boxMemorySwapoutWindowMs: { env: 'TLDA_DEV_BOT_BOX_MEMORY_SWAPOUT_WINDOW_MS', default: 600_000, description: 'Trailing window for the box-memory swapout rate.', parse: configTypes.integer, validate: positive },
+  boxMemorySwapoutRatePerS: { env: 'TLDA_DEV_BOT_BOX_MEMORY_SWAPOUT_RATE_PER_S', default: 100, description: 'Swapout pages/s at or above which the box-memory swap leg trips.', parse: configTypes.integer, validate: positive },
+  boxMemoryTopN: { env: 'TLDA_DEV_BOT_BOX_MEMORY_TOP_N', default: 5, description: 'Top-N RSS entries carried per box-memory sample.', parse: configTypes.integer, validate: positive },
+  boxMemoryClimbSamples: { env: 'TLDA_DEV_BOT_BOX_MEMORY_CLIMB_SAMPLES', default: 3, description: 'Trailing readings per pid for the box-memory climber leg.', parse: configTypes.integer, validate: positive },
+  boxMemoryClimbRateMbPerMin: { env: 'TLDA_DEV_BOT_BOX_MEMORY_CLIMB_RATE_MB_PER_MIN', default: 850, description: 'Per-process growth MB/min that trips the box-memory climber leg.', parse: configTypes.integer, validate: positive },
+  boxMemoryReapClimbers: { env: 'TLDA_DEV_BOT_BOX_MEMORY_REAP_CLIMBERS', default: false, description: 'Whether the climber leg reaps verified climbing renderers. Detection and alerting run regardless.', parse: configTypes.boolean },
 })
 const config = parseConfig(configSchema)
 const {
@@ -127,6 +134,9 @@ const {
   agentSilenceWindowMs: AGENT_SILENCE_WINDOW_MS, agentSilenceLookbackMs: AGENT_SILENCE_LOOKBACK_MS,
   agentWatchIntervalMs: AGENT_WATCH_INTERVAL_MS, agentJoinGraceMs: AGENT_JOIN_GRACE_MS,
   rosterTimeoutMs: ROSTER_TIMEOUT_MS,
+  boxMemorySwapoutWindowMs: BOX_MEMORY_SWAPOUT_WINDOW_MS, boxMemorySwapoutRatePerS: BOX_MEMORY_SWAPOUT_RATE_PER_S,
+  boxMemoryTopN: BOX_MEMORY_TOP_N, boxMemoryClimbSamples: BOX_MEMORY_CLIMB_SAMPLES,
+  boxMemoryClimbRateMbPerMin: BOX_MEMORY_CLIMB_RATE_MB_PER_MIN, boxMemoryReapClimbers: BOX_MEMORY_REAP_CLIMBERS,
   serverImportsRepo: SERVER_IMPORTS_REPO, serverImportsIntervalMs: SERVER_IMPORTS_INTERVAL_MS,
   daemonLedgerDb: DAEMON_LEDGER_DB, daemonMintDb: DAEMON_MINT_DB,
   botHeartbeatStaleMs: BOT_HEARTBEAT_STALE_MS,
@@ -214,6 +224,14 @@ function restoreActiveFailure() {
 }
 const playwrightPoolCleanup = createPlaywrightPoolCleanup()
 const worktreeCleanup = createWorktreeCleanup()
+const boxMemoryWatch = createBoxMemoryWatch({
+  swapoutWindowMs: BOX_MEMORY_SWAPOUT_WINDOW_MS,
+  swapoutRateThresholdPerS: BOX_MEMORY_SWAPOUT_RATE_PER_S,
+  topN: BOX_MEMORY_TOP_N,
+  climbSamples: BOX_MEMORY_CLIMB_SAMPLES,
+  climbRateMbPerMin: BOX_MEMORY_CLIMB_RATE_MB_PER_MIN,
+})
+const climberReaper = createClimberReaper()
 let resourceCleanupTimer = null
 let resourceCleanupInFlight = false
 let lastWorktreeCleanupAt = 0
@@ -2125,7 +2143,74 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'notification-consumption', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup']
+const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'notification-consumption', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup', 'box-memory']
+
+// The box-memory watch: Mini memory-pressure signals for the ops team, from
+// ops-oncall's night of hand sampling (swapout rate, top-N by full command
+// with per-pid deltas, pressure transitions, playwright triple) plus the
+// chief's climber leg (single-process growth rate, browsers only).
+//
+// An open excursion fails the check, which nudges on-call with the transition,
+// the rate and window, the largest process by full command line, and the
+// firing state; the standard recovery path announces the clear. No leg acts on
+// anything except the climber leg feeding the reaper, and only when
+// TLDA_DEV_BOT_BOX_MEMORY_REAP_CLIMBERS is set: detection and alerting run
+// regardless of the flag. A pid killed on one sweep is gone from the next
+// sample and stops tripping on its own, so no sent-pids set is needed — the
+// reaper's fresh-read verification is the guard against pid reuse.
+function boxMemoryRunner(cmd, args) {
+  return execFileSync(cmd, args, { encoding: 'utf8', timeout: 10_000 })
+}
+
+export async function checkBoxMemory({
+  watch = boxMemoryWatch,
+  reaper = climberReaper,
+  reapClimbers = BOX_MEMORY_REAP_CLIMBERS,
+  run = boxMemoryRunner,
+  sample = null,
+} = {}) {
+  let assessment
+  try {
+    assessment = watch.observe(sample || collectBoxMemorySample({ run }))
+  } catch (e) {
+    if (e instanceof BoxMemorySetupError) throw new ProbeSetupError(`box-memory: ${e.message}`)
+    throw e
+  }
+  if (!assessment.excursion) {
+    return {
+      pressure: assessment.pressure.level,
+      settledLevel: assessment.pressure.settledLevel,
+      swapoutRatePerS: assessment.swap.ratePerS,
+      swapoutWindowS: assessment.swap.windowS,
+      triple: { servers: assessment.triple.servers, browsers: assessment.triple.browsers, orphans: assessment.triple.orphans },
+      largest: assessment.largest ? { pid: assessment.largest.pid, rssKb: assessment.largest.rssKb } : null,
+    }
+  }
+  const notice = [formatExcursionNotice(assessment)]
+  const climberLeg = assessment.excursion.legs.climber
+  if (climberLeg) {
+    if (!reapClimbers) {
+      notice.push('- climber reaping: disabled (TLDA_DEV_BOT_BOX_MEMORY_REAP_CLIMBERS is off); detection and alerting only')
+    } else {
+      const candidates = assessment.climbers.map(entry => ({ pid: entry.pid, rssKb: entry.rssKb }))
+      const results = await reaper.reap(candidates)
+      for (const result of results) {
+        // Continuation lines, not `- ` lines: reap outcomes change sweep to
+        // sweep (killed, then gone) and must not churn the nudge key. The
+        // durable record is the heartbeat below, written on every action.
+        notice.push(`  reap pid ${result.pid}: ${result.killed ? 'killed' : 'NOT killed'} — ${result.reason}`)
+      }
+      if (results.length) {
+        writeHeartbeat('box-memory-reap', {
+          pids: results.map(result => result.pid),
+          killed: results.filter(result => result.killed).map(result => result.pid),
+          results: results.map(({ pid, verified, killed, reason }) => ({ pid, verified, killed, reason })),
+        })
+      }
+    }
+  }
+  throw new Error(notice.join('\n'))
+}
 
 export async function checkResourceCleanup({
   previewReaper = reapIdlePreviews,
@@ -2213,6 +2298,7 @@ export function allChecks() {
     ['server-imports', checkServerImportResolution],
     ['bot-heartbeats', checkBotHeartbeats],
     ['resource-cleanup', checkResourceCleanup],
+    ['box-memory', checkBoxMemory],
   ]
 }
 

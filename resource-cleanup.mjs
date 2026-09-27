@@ -5,6 +5,7 @@ import path from 'path'
 import { promisify } from 'util'
 import { fileURLToPath } from 'url'
 import { classifyWorktreeIgnored, IGNORED_STATUS_ARGS } from '@tlda/bot'
+import { isRendererProcess } from './box-memory.mjs'
 
 const execFileP = promisify(execFile)
 const MAIN_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tlda')
@@ -523,4 +524,104 @@ export function createPlaywrightPoolCleanup({
   }
 
   return { sweep }
+}
+
+// The one narrow automated action Skip authorises: reaping a CLIMBING renderer.
+// Everything else the box-memory watch finds is report-with-evidence.
+//
+// The candidate pids come from the climber leg (box-memory.mjs), which trips on
+// growth rate. This reaps them only after re-verifying, on a FRESH read, that
+// the pid is still the same kind of thing that tripped: a detection snapshot
+// is already a sweep old when it is acted on, and pids are reused, so killing
+// on the snapshot alone could take an innocent process that inherited the pid.
+//
+// Verification policy (all must hold, else refuse with a reason):
+//  1. the pid exists now;
+//  2. its CURRENT command line is still a chromium renderer (--type=renderer).
+//     A climbing MAIN browser trips the detector but is refused here: killing
+//     it takes the whole pooled browser and every tab with it, which is acting
+//     on other agents' walks, not reaping a runaway;
+//  3. its CURRENT RSS is still at or above minRssKb. A renderer that already
+//     shrank below this is not the emergency the snapshot described — and a
+//     reused pid belonging to a small process fails here even if a renderer
+//     happened to inherit it.
+//
+// Killing a renderer crashes its tab (the browser survives); that is the
+// intended effect, and the evidence record says exactly what was killed and why.
+export const CLIMBER_REAP_MIN_RSS_KB = 256 * 1024
+
+export function createClimberReaper({
+  run = execFileP,
+  kill = pid => process.kill(pid, 'SIGKILL'),
+  now = () => new Date().toISOString(),
+  minRssKb = CLIMBER_REAP_MIN_RSS_KB,
+} = {}) {
+  async function currentState(pid) {
+    try {
+      const { stdout } = await run('ps', ['-o', 'pid=,rss=,command=', '-p', String(pid)], {
+        timeout: 10_000,
+        encoding: 'utf8',
+      })
+      const match = String(stdout || '').match(/^\s*(\d+)\s+(\d+)\s+(.*)$/m)
+      if (!match) return { alive: false }
+      return { alive: true, pid: Number(match[1]), rssKb: Number(match[2]), command: match[3] }
+    } catch (error) {
+      // `ps -p` exits nonzero for a dead pid. Gone is gone: not an error.
+      return { alive: false }
+    }
+  }
+
+  async function reapOne(candidate, { dryRun = false } = {}) {
+    const at = now()
+    const base = { pid: candidate.pid, rssBeforeKb: candidate.rssKb ?? null, at }
+    const state = await currentState(candidate.pid)
+    if (!state.alive) {
+      return { ...base, verified: false, killed: false, reason: 'pid already gone' }
+    }
+    if (!isRendererProcess(state.command)) {
+      return {
+        ...base, verified: false, killed: false,
+        rssNowKb: state.rssKb, commandNow: state.command,
+        reason: 'current command is not a chromium renderer — refusing (pid reused or process changed)',
+      }
+    }
+    if (!(state.rssKb >= minRssKb)) {
+      return {
+        ...base, verified: false, killed: false,
+        rssNowKb: state.rssKb, commandNow: state.command,
+        reason: `current RSS ${Math.round(state.rssKb / 1024)}MB is below the ${Math.round(minRssKb / 1024)}MB floor — refusing (shrunk or reused pid)`,
+      }
+    }
+    if (dryRun) {
+      return {
+        ...base, verified: true, killed: false, dryRun: true,
+        rssNowKb: state.rssKb, commandNow: state.command,
+        reason: 'verified; dry run, nothing killed',
+      }
+    }
+    try {
+      await kill(candidate.pid)
+    } catch (error) {
+      return {
+        ...base, verified: true, killed: false,
+        rssNowKb: state.rssKb, commandNow: state.command,
+        reason: `kill failed: ${error?.message || String(error)}`,
+      }
+    }
+    return {
+      ...base, verified: true, killed: true,
+      rssNowKb: state.rssKb, commandNow: state.command,
+      reason: 'climbing renderer reaped',
+    }
+  }
+
+  async function reap(candidates, options = {}) {
+    const results = []
+    for (const candidate of candidates || []) {
+      results.push(await reapOne(candidate, options))
+    }
+    return results
+  }
+
+  return { reap }
 }

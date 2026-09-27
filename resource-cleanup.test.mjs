@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { createPlaywrightPoolCleanup, createWorktreeCleanup, createXcrunCacheCleanup } from './resource-cleanup.mjs'
+import { CLIMBER_REAP_MIN_RSS_KB, createClimberReaper, createPlaywrightPoolCleanup, createWorktreeCleanup, createXcrunCacheCleanup } from './resource-cleanup.mjs'
 
 // The two-minute window is the only thing making this safe to run on a busy
 // box: these files are the losing half of a copy-then-rename, so deleting one
@@ -521,4 +521,100 @@ test('the sweep reports what it did not examine', async () => {
   assert.equal(result.skipped.dirty, 1)
   assert.equal(result.skipped.unmergedByAncestry, 1)
   assert.equal(result.examined + result.skippedTotal, 3)
+})
+
+// ---------------------------------------------------------------------------
+// Climber reaper: the one narrow automated action — a climbing renderer.
+// ---------------------------------------------------------------------------
+
+const CLIMBER_RENDERER_REAL = '/Users/skip/Library/Caches/ms-playwright/chromium-1232/chrome-mac-arm64/Google Chrome for Testing.app/Contents/Frameworks/Helpers/Google Chrome for Testing Helper (Renderer) --type=renderer --user-data-dir=/tmp/ud-shared-chrome'
+const MAIN_BROWSER = '/Users/skip/Library/Caches/ms-playwright/chromium-1232/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing --user-data-dir=/tmp/ud-shared-chrome'
+
+function fakePs(stateByPid) {
+  return async (command, args) => {
+    assert.equal(command, 'ps')
+    const pid = Number(args[args.length - 1])
+    const state = stateByPid[pid]
+    if (!state) {
+      const error = new Error('ps: No such process')
+      error.code = 1
+      throw error
+    }
+    return { stdout: `  ${pid}  ${state.rssKb} ${state.command}\n` }
+  }
+}
+
+test('climber reaper kills a verified climbing renderer and records the evidence', async () => {
+  const killed = []
+  const reaper = createClimberReaper({
+    run: fakePs({ 37007: { rssKb: 4_267 * 1024, command: CLIMBER_RENDERER_REAL } }),
+    kill: async pid => { killed.push(pid) },
+    now: () => '2026-09-27T05:00:00.000Z',
+  })
+  const [result] = await reaper.reap([{ pid: 37007, rssKb: 4_000 * 1024 }])
+  assert.deepEqual(killed, [37007])
+  assert.equal(result.verified, true)
+  assert.equal(result.killed, true)
+  assert.equal(result.rssNowKb, 4_267 * 1024)
+  assert.match(result.reason, /reaped/)
+})
+
+test('climber reaper refuses a pid whose command is no longer a renderer', async () => {
+  const killed = []
+  const reaper = createClimberReaper({
+    run: fakePs({ 37007: { rssKb: 4_267 * 1024, command: '/usr/bin/python3 some-innocent-script' } }),
+    kill: async pid => { killed.push(pid) },
+  })
+  const [result] = await reaper.reap([{ pid: 37007, rssKb: 4_000 * 1024 }])
+  assert.deepEqual(killed, [])
+  assert.equal(result.verified, false)
+  assert.match(result.reason, /not a chromium renderer/)
+})
+
+test('climber reaper refuses a climbing main browser: alert, never reap', async () => {
+  const killed = []
+  const reaper = createClimberReaper({
+    run: fakePs({ 26270: { rssKb: 4_267 * 1024, command: MAIN_BROWSER } }),
+    kill: async pid => { killed.push(pid) },
+  })
+  const [result] = await reaper.reap([{ pid: 26270, rssKb: 4_000 * 1024 }])
+  assert.deepEqual(killed, [])
+  assert.equal(result.verified, false)
+})
+
+test('climber reaper refuses a renderer that shrank below the floor', async () => {
+  const killed = []
+  const reaper = createClimberReaper({
+    run: fakePs({ 37007: { rssKb: 72 * 1024, command: CLIMBER_RENDERER_REAL } }),
+    kill: async pid => { killed.push(pid) },
+  })
+  const [result] = await reaper.reap([{ pid: 37007, rssKb: 4_000 * 1024 }])
+  assert.deepEqual(killed, [])
+  assert.equal(result.verified, false)
+  assert.match(result.reason, /below the 256MB floor/)
+  assert.equal(CLIMBER_REAP_MIN_RSS_KB, 256 * 1024)
+})
+
+test('climber reaper treats a dead pid as gone, not as an error', async () => {
+  const killed = []
+  const reaper = createClimberReaper({
+    run: fakePs({}),
+    kill: async pid => { killed.push(pid) },
+  })
+  const [result] = await reaper.reap([{ pid: 37007, rssKb: 4_000 * 1024 }])
+  assert.deepEqual(killed, [])
+  assert.equal(result.reason, 'pid already gone')
+})
+
+test('climber reaper dry-run verifies without killing', async () => {
+  const killed = []
+  const reaper = createClimberReaper({
+    run: fakePs({ 37007: { rssKb: 4_267 * 1024, command: CLIMBER_RENDERER_REAL } }),
+    kill: async pid => { killed.push(pid) },
+  })
+  const [result] = await reaper.reap([{ pid: 37007, rssKb: 4_000 * 1024 }], { dryRun: true })
+  assert.deepEqual(killed, [])
+  assert.equal(result.verified, true)
+  assert.equal(result.killed, false)
+  assert.equal(result.dryRun, true)
 })
