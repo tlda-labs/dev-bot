@@ -1,11 +1,23 @@
 import assert from 'node:assert/strict'
-import { spawn } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
 import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
-import { CLIMBER_REAP_MIN_RSS_KB, createClimberReaper, createPlaywrightPoolCleanup, createWorktreeCleanup, createXcrunCacheCleanup } from './resource-cleanup.mjs'
+import { CLIMBER_REAP_MIN_RSS_KB, createClimberReaper, createPlaywrightPoolCleanup as createPoolCleanup, createWorktreeCleanup, createXcrunCacheCleanup } from './resource-cleanup.mjs'
+
+function createPlaywrightPoolCleanup(options) {
+  const run = options.run || promisify(execFile)
+  return createPoolCleanup({
+    readLockOwner: async () => ({ known: true, live: false }),
+    ...options,
+    run: (command, args, config) => command === 'bash' && args[0].endsWith('/bin/pw-lock.sh')
+      ? Promise.resolve({ stdout: '' })
+      : run(command, args, config),
+  })
+}
 
 // The two-minute window is the only thing making this safe to run on a busy
 // box: these files are the losing half of a copy-then-rename, so deleting one

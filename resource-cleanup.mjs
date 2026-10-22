@@ -1,11 +1,12 @@
 import { execFile } from 'child_process'
 import { readdir, readFile, rm, stat } from 'fs/promises'
-import { homedir } from 'os'
 import path from 'path'
 import { promisify } from 'util'
 import { fileURLToPath } from 'url'
+import { randomUUID } from 'crypto'
 import { classifyWorktreeIgnored, IGNORED_STATUS_ARGS } from '@tlda/bot'
 import { isRendererProcess } from './box-memory.mjs'
+import { PW_RUNTIME_DIR } from '../../tlda/cli/lib/resource-leases.mjs'
 
 const execFileP = promisify(execFile)
 const MAIN_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tlda')
@@ -343,7 +344,7 @@ function withinDeadline(promise, timeoutMs, label, onTimeout = () => {}) {
   return Promise.race([promise, deadline]).finally(() => clearTimeout(timer))
 }
 
-async function lastPlaywrightTouch(session, touchDir = path.join(homedir(), '.config', 'tlda', 'pw-touch')) {
+async function lastPlaywrightTouch(session, touchDir = path.join(PW_RUNTIME_DIR, 'pw-touch')) {
   let files
   try {
     files = await readdir(touchDir)
@@ -366,6 +367,38 @@ async function lastPlaywrightTouch(session, touchDir = path.join(homedir(), '.co
   return { known: true, at: latest }
 }
 
+function playwrightLockPath(session, baseSession) {
+  return path.join(PW_RUNTIME_DIR, session === baseSession ? '.pw.lock' : `.pw.${session}.lock`)
+}
+
+export async function readPlaywrightLockOwner(session, baseSession, read = readFile, {
+  now = () => Date.now(), staleSeconds = Number(process.env.TLDA_PW_LOCK_STALE || 90),
+} = {}) {
+  const file = playwrightLockPath(session, baseSession)
+  let record
+  try {
+    record = await read(file, 'utf8')
+  } catch (error) {
+    return { known: error?.code === 'ENOENT', live: false }
+  }
+  const [holder, timestamp, rawPid = '0'] = record.trim().split('\t')
+  const pid = Number(rawPid)
+  if (!holder || !Number.isSafeInteger(Number(timestamp)) || !Number.isSafeInteger(pid) || pid < 0) return { known: false, live: false }
+  if (!pid) {
+    if (!Number.isSafeInteger(staleSeconds) || staleSeconds < 0) return { known: false, live: false }
+    return Math.floor(now() / 1000) - Number(timestamp) < staleSeconds
+      ? { known: true, live: true, holder, pid }
+      : { known: true, live: false }
+  }
+  try {
+    process.kill(pid, 0)
+    return { known: true, live: true, holder, pid }
+  } catch (error) {
+    if (error?.code === 'EPERM') return { known: true, live: true, holder, pid }
+    return { known: error?.code === 'ESRCH', live: false }
+  }
+}
+
 export function createPlaywrightPoolCleanup({
   run = execFileP,
   now = () => Date.now(),
@@ -382,30 +415,64 @@ export function createPlaywrightPoolCleanup({
   playwrightCli = process.env.PLAYWRIGHT_CLI_BIN || path.join(MAIN_REPO, 'node_modules/.bin/playwright-cli'),
   tldaDev = process.env.TLDA_DEV_BIN || path.join(MAIN_REPO, 'cli/tlda-dev.mjs'),
   readLastTouch = session => lastPlaywrightTouch(session),
+  readLockOwner = session => readPlaywrightLockOwner(session, baseSession),
+  lockPath = session => playwrightLockPath(session, baseSession),
 } = {}) {
   const emptySince = new Map()
   const unhealthySince = new Map()
   let inventoryInFlight = null
 
   async function reap(session) {
-    const env = { ...process.env, TLDA_PW_SESSION: session }
+    const owner = await readLockOwner(session)
+    if (owner.live) return { claimed: true }
+    if (!owner.known) return 'lock ownership is unreadable, preserving browser'
+    const claim = `dev-pool-cleanup:${process.pid}:${randomUUID()}`
+    const lockScript = path.join(MAIN_REPO, 'bin/pw-lock.sh')
+    const env = { ...process.env, TLDA_PW_SESSION: session, TLDA_PW_LOCK: lockPath(session) }
+    let failure = null
     try {
-      await run(tldaDev, ['pw', 'reap'], {
-        timeout: reapTimeoutMs,
-        killSignal: 'SIGKILL',
-        encoding: 'utf8',
-        env,
-      })
-      return null
-    } catch (error) {
-      const facts = [
-        `timeout=${reapTimeoutMs}ms`,
-        `killed=${error?.killed === true}`,
-        `signal=${error?.signal || 'none'}`,
-        `code=${error?.code ?? 'none'}`,
-      ].join(', ')
-      return `${error?.message || String(error)} (${facts})`
+      try {
+        // Use ordinary cooperative exclusion, without waiting or stealing. A
+        // holder arriving after the read above must block destructive dispatch.
+        await run('bash', [lockScript, 'acquire', claim, '--pid', String(process.pid)], {
+          timeout: queryTimeoutMs, encoding: 'utf8', env,
+        })
+      } catch (error) {
+        failure = `could not acquire cleanup lock: ${error?.stderr || error?.message || String(error)}`
+      }
+      if (!failure) {
+        try {
+          await run(tldaDev, ['pw', 'reap'], {
+            timeout: reapTimeoutMs,
+            killSignal: 'SIGKILL',
+            encoding: 'utf8',
+            env,
+          })
+        } catch (error) {
+          const facts = [
+            `timeout=${reapTimeoutMs}ms`,
+            `killed=${error?.killed === true}`,
+            `signal=${error?.signal || 'none'}`,
+            `code=${error?.code ?? 'none'}`,
+          ].join(', ')
+          failure = `${error?.message || String(error)} (${facts})`
+        }
+      }
+    } finally {
+      try {
+        // Explicit force-reap already frees the lock after its destructive
+        // work. Acquisition may also have written our claim before reporting
+        // failure, so release on that path too. Only this invocation's claim
+        // can be removed, never another holder's lock.
+        await run('bash', [lockScript, 'release', claim], {
+          timeout: queryTimeoutMs, encoding: 'utf8', env,
+        })
+      } catch (error) {
+        const detail = `cleanup lock release failed: ${error?.stderr || error?.message || String(error)}`
+        failure = failure ? `${failure}; ${detail}` : detail
+      }
     }
+    return failure
   }
 
   function inventory() {
@@ -425,6 +492,14 @@ export function createPlaywrightPoolCleanup({
   }
 
   async function noteUnhealthy(session, error) {
+    const active = () => {
+      unhealthySince.delete(session)
+      emptySince.delete(session)
+      return { session, state: 'claimed' }
+    }
+    const owner = await readLockOwner(session)
+    if (owner.live) return active()
+    if (!owner.known) return { session, state: 'error', error: `${error?.message || String(error)}; live lock ownership is unreadable, preserving browser` }
     const observedAt = now()
     if (!unhealthySince.has(session)) unhealthySince.set(session, observedAt)
     const idleMs = observedAt - unhealthySince.get(session)
@@ -443,6 +518,7 @@ export function createPlaywrightPoolCleanup({
     }
 
     const reapError = await reap(session)
+    if (reapError?.claimed) return active()
     if (reapError) {
       return {
         session,
@@ -489,7 +565,12 @@ export function createPlaywrightPoolCleanup({
     if (idleMs < emptyIdleMs) return { session, state: 'empty', idleMs }
 
     const reapError = await reap(session)
-    if (reapError) throw new Error(`reap failed: ${reapError}`)
+    if (reapError?.claimed) {
+      emptySince.delete(session)
+      unhealthySince.delete(session)
+      return { session, state: 'claimed' }
+    }
+    if (reapError) return { session, state: 'error', error: `reap failed: ${reapError}`, idleMs }
     emptySince.delete(session)
     return { session, state: 'reaped', idleMs }
   }
