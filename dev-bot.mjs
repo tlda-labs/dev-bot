@@ -1635,17 +1635,24 @@ async function lastProducedAt(agentId) {
 // over three days of testing history, todd check-ins and build notices were 15
 // of the 37 raw instances of this condition and every one of them was benign.
 // An agent does not owe a bot nudge a reaction.
-async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
+//
+// The same read also gives the agent's own latest chat. A chat it sent is
+// output whatever runs it: a cloud session has no transcript here, so its
+// session history is always empty and a cloud agent answering every message
+// read as having produced nothing (app-qc-reviewer, 2026-11-11, raised for
+// two hours while it sent re-checks).
+async function chatHistoryOf(agentId, botIds, sinceIso) {
   const result = await sendRequest({
     type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId, agentOnly: true,
     historyOnly: true, eventOnly: true, eventType: 'chat', since: sinceIso, limit: 50,
   }, 10_000).catch(e => { throw new ProbeSetupError(`chat history for ${agentId} did not answer: ${e.message}`) })
   const rows = (Array.isArray(result?.results) ? result.results : []).filter(r => r.source === 'fleet')
+  const newestFirst = (a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || ''))
   const received = rows.filter(row =>
     row.from && row.from !== agentId && !botIds.has(row.from) &&
     (Array.isArray(row.recipients) ? row.recipients.includes(agentId) : true))
-  received.sort((a, b) => String(b.timestamp || '').localeCompare(String(a.timestamp || '')))
-  return received[0] || null
+  const sent = rows.filter(row => row.from === agentId)
+  return { delivery: received.sort(newestFirst)[0] || null, lastSentAt: sent.sort(newestFirst)[0]?.timestamp || null }
 }
 
 // One roster read per cadence window. `lastResult` is replayed on a
@@ -1874,11 +1881,12 @@ async function runAgentReceiving() {
   // true positive it existed to catch. `last_seen` is reported below as context
   // and is not a precondition.
   for (const row of candidates) {
-    const delivery = await lastRealDeliveryTo(row.id, botIds, sinceIso)
+    const { delivery, lastSentAt } = await chatHistoryOf(row.id, botIds, sinceIso)
     if (!delivery?.timestamp) continue
     const deliveredAt = Date.parse(delivery.timestamp)
     // Not yet decidable: the window has not elapsed since the delivery.
     if (!Number.isFinite(deliveredAt) || now - deliveredAt < AGENT_SILENCE_WINDOW_MS) continue
+    if (Date.parse(lastSentAt || '') > deliveredAt) continue
     const produced = await lastProducedAt(row.id)
     const producedAt = Date.parse(produced || '')
     if (Number.isFinite(producedAt) && producedAt > deliveredAt) continue
