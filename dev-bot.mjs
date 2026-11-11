@@ -30,7 +30,7 @@ import {
 import { labelsForAgent, reapIdlePreviews, surveyBotHeartbeats } from '@tlda/bot'
 import { BoxMemorySetupError, collectSample as collectBoxMemorySample, createBoxMemoryWatch, formatExcursionNotice } from './box-memory.mjs'
 import { createClimberReaper, createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
-import { checkServerImports, describeServerImportFailures } from './server-import-resolution.mjs'
+import { pathToFileURL as importCheckUrl } from 'node:url'
 import { createGitRemoteProbeDriver, runLinkedRemoteProbe } from './linked-remote-probe.mjs'
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -1955,9 +1955,17 @@ export async function checkServerImportResolution() {
     return { ...(lastServerImportsResult?.value || {}), cached: true }
   }
   lastServerImportsAt = now
-  let report
+  let report, describeServerImportFailures
   try {
-    report = checkServerImports({ repoRoot: SERVER_IMPORTS_REPO })
+    // The check comes from the checkout it checks, so its list of what the
+    // image ships cannot fall behind that checkout's Dockerfile. A private copy
+    // here did, on 2026-11-10, and reported shipped files as missing.
+    // Keyed by the file's mtime: the script holds the shipped-path list as a
+    // module constant, so a cached import keeps checking against a stale list.
+    const checkPath = `${SERVER_IMPORTS_REPO}/scripts/check-server-imports.mjs`
+    const check = await import(`${importCheckUrl(checkPath).href}?mtime=${fs.statSync(checkPath).mtimeMs}`)
+    describeServerImportFailures = check.describeServerImportFailures
+    report = check.checkServerImports({ repoRoot: SERVER_IMPORTS_REPO })
   } catch (e) {
     // A checkout that cannot be read is a setup problem, not a finding. Saying
     // "no missing imports" here would be the check reporting a pass it did not
