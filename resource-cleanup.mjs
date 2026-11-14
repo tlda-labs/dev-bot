@@ -1,16 +1,29 @@
 import { execFile } from 'child_process'
-import { readdir, readFile, rm, stat } from 'fs/promises'
+import { existsSync } from 'fs'
+import { open, readdir, readFile, rm, stat, utimes, writeFile } from 'fs/promises'
+import os from 'os'
 import path from 'path'
+import { DatabaseSync } from 'node:sqlite'
 import { promisify } from 'util'
 import { fileURLToPath } from 'url'
 import { randomUUID } from 'crypto'
-import { classifyWorktreeIgnored, IGNORED_STATUS_ARGS } from '@tlda/bot'
+import { classifyWorktreeIgnored, CONFIG_DIR, IGNORED_STATUS_ARGS, labelsForAgent } from '@tlda/bot'
 import { isRendererProcess } from './box-memory.mjs'
-import { PW_RUNTIME_DIR } from '../../tlda/cli/lib/resource-leases.mjs'
 
 const execFileP = promisify(execFile)
-const MAIN_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tlda')
-export const DEFAULT_WORKTREE_NODE_MODULES_BUDGET_BYTES = 50 * 1024 ** 3
+export const PW_RUNTIME_DIR = '/tmp/tlda-pw-runtime'
+const RELATIVE_MAIN_REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../tlda')
+const MAIN_REPO = existsSync(path.join(RELATIVE_MAIN_REPO, 'package.json'))
+  ? RELATIVE_MAIN_REPO
+  : path.join(os.homedir(), 'work', 'tlda')
+export const DEFAULT_WORKTREE_NODE_MODULES_BUDGET_BYTES = 10 * 1024 ** 3
+export const DEFAULT_HEARTBEAT_FILE_MAX_BYTES = 256 * 1024
+export const DEFAULT_HEARTBEAT_FILE_RETAIN_BYTES = 128 * 1024
+export const DEFAULT_CONFIG_LOG_MAX_BYTES = 25 * 1024 * 1024
+export const DEFAULT_CONFIG_LOG_RETAIN_BYTES = 5 * 1024 * 1024
+export const DEFAULT_CLAUDE_TMP_MIN_AGE_MS = 4 * 60 * 60_000
+export const DEFAULT_HARNESS_ROLLOUT_ORPHAN_MIN_AGE_MS = 7 * 24 * 60 * 60_000
+export const DEFAULT_HARNESS_ROLLOUT_DEAD_GRACE_MS = 60 * 60_000
 export const PLAYWRIGHT_SWEEP_TIMEOUT_MS = 120_000
 export const PLAYWRIGHT_REAP_TIMEOUT_MS = PLAYWRIGHT_SWEEP_TIMEOUT_MS
 
@@ -159,7 +172,10 @@ export function createWorktreeCleanup({
   measureNodeModules = entries => sizeNodeModules(run, entries),
   readStat = stat,
 } = {}) {
-  async function sweep() {
+  async function sweep({ budgetBytes: sweepBudgetBytes = budgetBytes } = {}) {
+    const effectiveBudgetBytes = Number.isFinite(sweepBudgetBytes) && sweepBudgetBytes >= 0
+      ? sweepBudgetBytes
+      : budgetBytes
     const worktrees = await listWorktrees()
     const main = path.resolve(repoRoot)
     const activeCwds = await listActiveCwds()
@@ -294,17 +310,18 @@ export function createWorktreeCleanup({
     let retainedBytes = totalBytes
     const evicted = []
     for (const entry of measured.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
-      if (retainedBytes <= budgetBytes) break
+      if (retainedBytes <= effectiveBudgetBytes) break
+      if (!(entry.sizeBytes > 0)) continue
       if (isActive(entry)) continue
       await removeNodeModules(entry.nodeModules)
       retainedBytes -= entry.sizeBytes
       evicted.push(entry)
     }
     return {
-      budgetBytes,
+      budgetBytes: effectiveBudgetBytes,
       totalBytes,
       retainedBytes,
-      overBudgetBytes: Math.max(0, retainedBytes - budgetBytes),
+      overBudgetBytes: Math.max(0, retainedBytes - effectiveBudgetBytes),
       evicted,
       pinned,
       abandoned,
@@ -705,4 +722,596 @@ export function createClimberReaper({
   }
 
   return { reap }
+}
+
+async function defaultReadTailBuffer(target, size, retainBytes) {
+  const windowBytes = Math.min(size, retainBytes)
+  const startOffset = Math.max(0, size - windowBytes)
+  const handle = await open(target, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(windowBytes)
+    const { bytesRead } = await handle.read(buffer, 0, windowBytes, startOffset)
+    const raw = buffer.subarray(0, bytesRead)
+    if (startOffset === 0) return raw
+    const newlineIdx = raw.indexOf(0x0a)
+    if (newlineIdx >= 0 && newlineIdx + 1 < raw.length) {
+      return raw.subarray(newlineIdx + 1)
+    }
+    return raw
+  } finally {
+    await handle.close()
+  }
+}
+
+export function createConfigLogCleanup({
+  configDir = CONFIG_DIR,
+  heartbeatMaxBytes = DEFAULT_HEARTBEAT_FILE_MAX_BYTES,
+  heartbeatRetainBytes = DEFAULT_HEARTBEAT_FILE_RETAIN_BYTES,
+  logMaxBytes = DEFAULT_CONFIG_LOG_MAX_BYTES,
+  logRetainBytes = DEFAULT_CONFIG_LOG_RETAIN_BYTES,
+  listEntries = readdir,
+  readStat = stat,
+  readTail = defaultReadTailBuffer,
+  writeTruncated = (target, data) => writeFile(target, data),
+  restoreTimes = (target, atime, mtime) => utimes(target, atime, mtime),
+} = {}) {
+  function classifyTarget(name) {
+    if (name.endsWith('.heartbeat')) {
+      return { kind: 'heartbeat', maxBytes: heartbeatMaxBytes, retainBytes: heartbeatRetainBytes, preserveTimes: true }
+    }
+    if (name.endsWith('.log') || name.endsWith('-decisions.jsonl')) {
+      return { kind: 'log', maxBytes: logMaxBytes, retainBytes: logRetainBytes, preserveTimes: false }
+    }
+    return null
+  }
+
+  async function sweep() {
+    let entries = []
+    try {
+      entries = await listEntries(configDir)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { dir: configDir, trimmedCount: 0, reclaimedBytes: 0, trimmed: [], errors: [] }
+      throw error
+    }
+    let trimmedCount = 0
+    let reclaimedBytes = 0
+    const trimmed = []
+    const errors = []
+    for (const name of entries) {
+      const rule = classifyTarget(name)
+      if (!rule) continue
+      const target = path.join(configDir, name)
+      try {
+        const metadata = await readStat(target)
+        if (typeof metadata?.isFile === 'function' && !metadata.isFile()) continue
+        if (!(metadata.size > rule.maxBytes)) continue
+        const tail = await readTail(target, metadata.size, rule.retainBytes)
+        await writeTruncated(target, tail)
+        if (rule.preserveTimes && metadata.atime && metadata.mtime) {
+          await restoreTimes(target, metadata.atime, metadata.mtime)
+        }
+        const afterBytes = tail.length
+        const delta = Math.max(0, metadata.size - afterBytes)
+        trimmedCount += 1
+        reclaimedBytes += delta
+        trimmed.push({
+          file: name,
+          kind: rule.kind,
+          beforeBytes: metadata.size,
+          afterBytes,
+          reclaimedBytes: delta,
+        })
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        errors.push(`${name}: ${error?.message || String(error)}`)
+      }
+    }
+    return { dir: configDir, trimmedCount, reclaimedBytes, trimmed, errors }
+  }
+
+  return { sweep }
+}
+
+async function defaultOpenFilesUnder(run, roots) {
+  const validRoots = (roots || []).filter(Boolean)
+  if (!validRoots.length) return new Set()
+  try {
+    const { stdout } = await run('lsof', ['-Fn', '--', ...validRoots], {
+      timeout: 15_000,
+      encoding: 'utf8',
+      maxBuffer: 10 * 1024 * 1024,
+    })
+    return new Set(
+      String(stdout || '')
+        .split('\n')
+        .filter(line => line.startsWith('n/'))
+        .map(line => path.resolve(line.slice(1))),
+    )
+  } catch (error) {
+    // lsof exits 1 when no open files match the given paths; output (if any) is still valid.
+    if (error?.code === 1 && typeof error?.stdout === 'string') {
+      return new Set(
+        error.stdout
+          .split('\n')
+          .filter(line => line.startsWith('n/'))
+          .map(line => path.resolve(line.slice(1))),
+      )
+    }
+    throw error
+  }
+}
+
+async function walkFilesRecursive(dir, listEntries, readStat) {
+  const files = []
+  let entries = []
+  try {
+    entries = await listEntries(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return files
+    throw error
+  }
+  for (const name of entries) {
+    const full = path.join(dir, name)
+    let metadata
+    try {
+      metadata = await readStat(full)
+    } catch (error) {
+      if (error?.code === 'ENOENT') continue
+      throw error
+    }
+    if (typeof metadata?.isSymbolicLink === 'function' && metadata.isSymbolicLink()) continue
+    if (typeof metadata?.isDirectory === 'function' && metadata.isDirectory()) {
+      files.push(...await walkFilesRecursive(full, listEntries, readStat))
+    } else if (typeof metadata?.isFile !== 'function' || metadata.isFile()) {
+      files.push({ path: full, size: metadata.size || 0, mtimeMs: metadata.mtimeMs || 0 })
+    }
+  }
+  return files
+}
+
+export function createClaudeTmpCleanup({
+  run = execFileP,
+  tmpRoot = '/private/tmp',
+  minAgeMs = DEFAULT_CLAUDE_TMP_MIN_AGE_MS,
+  listEntries = readdir,
+  readStat = stat,
+  removeFile = target => rm(target, { force: true }),
+  listOpenFiles = roots => defaultOpenFilesUnder(run, roots),
+  now = () => Date.now(),
+} = {}) {
+  async function sweep() {
+    let topEntries = []
+    try {
+      topEntries = await listEntries(tmpRoot)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { roots: [], removed: 0, removedBytes: 0, retained: 0, retainedBytes: 0, errors: [] }
+      throw error
+    }
+    const claudeRoots = topEntries
+      .filter(name => name.startsWith('claude-'))
+      .map(name => path.join(tmpRoot, name))
+    if (!claudeRoots.length) {
+      return { roots: [], removed: 0, removedBytes: 0, retained: 0, retainedBytes: 0, errors: [] }
+    }
+    const openFiles = await listOpenFiles(claudeRoots)
+    const cutoff = now() - minAgeMs
+    let removed = 0
+    let removedBytes = 0
+    let retained = 0
+    let retainedBytes = 0
+    const errors = []
+    for (const root of claudeRoots) {
+      let files = []
+      try {
+        const rootStat = await readStat(root)
+        if (typeof rootStat?.isSymbolicLink === 'function' && rootStat.isSymbolicLink()) continue
+        if (typeof rootStat?.isDirectory === 'function' && !rootStat.isDirectory()) {
+          if (typeof rootStat?.isFile !== 'function' || rootStat.isFile()) {
+            files = [{ path: root, size: rootStat.size || 0, mtimeMs: rootStat.mtimeMs || 0 }]
+          }
+        } else {
+          files = await walkFilesRecursive(root, listEntries, readStat)
+        }
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        errors.push(`${root}: ${error?.message || String(error)}`)
+        continue
+      }
+      for (const file of files) {
+        const resolved = path.resolve(file.path)
+        if (file.mtimeMs >= cutoff || openFiles.has(resolved)) {
+          retained += 1
+          retainedBytes += file.size
+          continue
+        }
+        try {
+          await removeFile(file.path)
+          removed += 1
+          removedBytes += file.size
+        } catch (error) {
+          if (error?.code === 'ENOENT') continue
+          errors.push(`${file.path}: ${error?.message || String(error)}`)
+        }
+      }
+    }
+    return { roots: claudeRoots, removed, removedBytes, retained, retainedBytes, errors }
+  }
+
+  return { sweep }
+}
+
+const UUID_SUFFIX_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
+const FLEET_ID_TOKEN_RE = /\bfleet:[a-z0-9_-]{4,}\b/gi
+
+function normalizeSessionTokens(rawId) {
+  if (typeof rawId !== 'string' || !rawId.trim()) return []
+  const base = rawId.trim().replace(/\.jsonl$/i, '')
+  const tokens = [base]
+  const uuidMatch = base.match(UUID_SUFFIX_RE)
+  if (uuidMatch && uuidMatch[1] !== base) tokens.push(uuidMatch[1])
+  return tokens
+}
+
+function defaultReadLocalAgentRecords({
+  mintDbPath = path.join(CONFIG_DIR, 'daemon-mints.sqlite'),
+  ledgerDbPath = path.join(CONFIG_DIR, 'fleet-daemon.db'),
+} = {}) {
+  const records = []
+  const mintDb = new DatabaseSync(mintDbPath, { open: true, readOnly: true })
+  try {
+    const mintRows = mintDb.prepare(
+      'SELECT mint_id, fleet_id, session_id, session_path, provisional_session_id, process_state FROM daemon_mints',
+    ).all()
+    for (const row of mintRows) {
+      let stateObj = null
+      if (typeof row.process_state === 'string' && row.process_state.trim()) {
+        try {
+          stateObj = JSON.parse(row.process_state)
+        } catch {
+          // Legacy non-JSON process_state values are ignored; direct row columns remain authoritative.
+          stateObj = null
+        }
+      }
+      records.push({
+        source: 'daemon_mints',
+        fleetId: row.fleet_id || stateObj?.fleet_id || null,
+        sessionIds: [
+          row.session_id,
+          row.provisional_session_id,
+          stateObj?.session_id,
+        ].filter(Boolean),
+        sessionPaths: [
+          row.session_path,
+          stateObj?.session_path,
+        ].filter(Boolean),
+        localDead: false,
+      })
+    }
+  } finally {
+    mintDb.close()
+  }
+
+  const ledgerDb = new DatabaseSync(ledgerDbPath, { open: true, readOnly: true })
+  try {
+    const localRows = ledgerDb.prepare(
+      'SELECT a.server_agent_id AS fleet_id, a.dead, c.session_id FROM local_agents a LEFT JOIN local_agent_conversations c ON a.local_agent_id = c.local_agent_id',
+    ).all()
+    for (const row of localRows) {
+      records.push({
+        source: 'local_agents',
+        fleetId: row.fleet_id || null,
+        sessionIds: [row.session_id].filter(Boolean),
+        sessionPaths: [],
+        localDead: Boolean(row.dead),
+      })
+    }
+    const grantRows = ledgerDb.prepare(
+      'SELECT id AS fleet_id, session_id, session_path, dead FROM permission_grants',
+    ).all()
+    for (const row of grantRows) {
+      records.push({
+        source: 'permission_grants',
+        fleetId: row.fleet_id || null,
+        sessionIds: [row.session_id].filter(Boolean),
+        sessionPaths: [row.session_path].filter(Boolean),
+        localDead: Boolean(row.dead),
+      })
+    }
+  } finally {
+    ledgerDb.close()
+  }
+
+  return records
+}
+
+async function defaultReadHeaderSnippet(target, maxBytes = 64 * 1024) {
+  const handle = await open(target, 'r')
+  try {
+    const buffer = Buffer.allocUnsafe(maxBytes)
+    const { bytesRead } = await handle.read(buffer, 0, maxBytes, 0)
+    return buffer.subarray(0, bytesRead).toString('utf8')
+  } finally {
+    await handle.close()
+  }
+}
+
+export function createHarnessRolloutCleanup({
+  run = execFileP,
+  configRoots = [
+    path.join(os.homedir(), '.tlda', 'configs'),
+    path.join(os.homedir(), '.tlda', 'configs-team'),
+  ],
+  mintDbPath = path.join(CONFIG_DIR, 'daemon-mints.sqlite'),
+  ledgerDbPath = path.join(CONFIG_DIR, 'fleet-daemon.db'),
+  orphanMinAgeMs = DEFAULT_HARNESS_ROLLOUT_ORPHAN_MIN_AGE_MS,
+  deadGraceMs = DEFAULT_HARNESS_ROLLOUT_DEAD_GRACE_MS,
+  readLocalRecords = () => defaultReadLocalAgentRecords({ mintDbPath, ledgerDbPath }),
+  lookupAgentsByIds = null,
+  listEntries = readdir,
+  readStat = stat,
+  readHeaderSnippet = defaultReadHeaderSnippet,
+  removeFile = target => rm(target, { force: true }),
+  listOpenFiles = roots => defaultOpenFilesUnder(run, roots),
+  now = () => Date.now(),
+} = {}) {
+  async function collectRolloutFiles(rootDir) {
+    let lanes = []
+    try {
+      lanes = await listEntries(rootDir)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return []
+      throw error
+    }
+    const rolloutFiles = []
+    for (const lane of lanes) {
+      const codexSessionsDir = path.join(rootDir, lane, 'codex', 'sessions')
+      const claudeProjectsDir = path.join(rootDir, lane, 'claude', 'projects')
+      for (const sessionRoot of [codexSessionsDir, claudeProjectsDir]) {
+        const walked = await walkFilesRecursive(sessionRoot, listEntries, readStat)
+        for (const entry of walked) {
+          if (entry.path.endsWith('.jsonl')) rolloutFiles.push(entry)
+        }
+      }
+    }
+    return rolloutFiles
+  }
+
+  async function sweep() {
+    if (typeof lookupAgentsByIds !== 'function') {
+      return {
+        skippedFailClosed: true,
+        reason: 'lookupAgentsByIds provider is missing; failing closed',
+        removed: 0,
+        removedBytes: 0,
+        retained: 0,
+        retainedBytes: 0,
+        errors: [],
+      }
+    }
+
+    let localRecords
+    try {
+      localRecords = await readLocalRecords()
+    } catch (error) {
+      return {
+        skippedFailClosed: true,
+        reason: `local mint/ledger read failed (${error?.message || String(error)}); failing closed`,
+        removed: 0,
+        removedBytes: 0,
+        retained: 0,
+        retainedBytes: 0,
+        errors: [],
+      }
+    }
+    if (!Array.isArray(localRecords) || localRecords.length === 0) {
+      return {
+        skippedFailClosed: true,
+        reason: 'local mint/ledger returned zero records; failing closed',
+        removed: 0,
+        removedBytes: 0,
+        retained: 0,
+        retainedBytes: 0,
+        errors: [],
+      }
+    }
+
+    const fleetIds = [...new Set(
+      localRecords
+        .map(record => record.fleetId)
+        .filter(id => typeof id === 'string' && id.startsWith('fleet:')),
+    )]
+    if (fleetIds.length === 0) {
+      return {
+        skippedFailClosed: true,
+        reason: 'no fleet IDs found in local mint/ledger records; failing closed',
+        removed: 0,
+        removedBytes: 0,
+        retained: 0,
+        retainedBytes: 0,
+        errors: [],
+      }
+    }
+
+    let serverAgents
+    try {
+      serverAgents = await lookupAgentsByIds(fleetIds)
+    } catch (error) {
+      return {
+        skippedFailClosed: true,
+        reason: `server agent lookup failed (${error?.message || String(error)}); failing closed`,
+        removed: 0,
+        removedBytes: 0,
+        retained: 0,
+        retainedBytes: 0,
+        errors: [],
+      }
+    }
+    if (!Array.isArray(serverAgents) || serverAgents.length === 0) {
+      return {
+        skippedFailClosed: true,
+        reason: 'server agent lookup returned zero agents; failing closed',
+        removed: 0,
+        removedBytes: 0,
+        retained: 0,
+        retainedBytes: 0,
+        errors: [],
+      }
+    }
+
+    const serverStateById = new Map()
+    for (const agent of serverAgents) {
+      if (!agent?.id) continue
+      const explicitLabels = new Set(Array.isArray(agent.labels) ? agent.labels : [])
+      const labels = new Set(labelsForAgent(agent))
+      const runtimeStatus = agent.runtime_status?.status || null
+      const isDead =
+        Boolean(agent.dead)
+        || runtimeStatus === 'dead'
+        || (explicitLabels.has('dead') && !explicitLabels.has('awake') && !explicitLabels.has('hibernating') && !runtimeStatus)
+      const state = labels.has('awake')
+        ? 'awake'
+        : isDead
+          ? 'dead'
+          : labels.has('hibernating')
+            ? 'hibernating'
+            : 'unknown'
+      serverStateById.set(agent.id, state)
+    }
+
+    const confirmedDeadFleetIds = new Set()
+    const protectedFleetIds = new Set()
+    for (const fleetId of fleetIds) {
+      const serverState = serverStateById.get(fleetId)
+      if (serverState === 'dead') {
+        confirmedDeadFleetIds.add(fleetId)
+      } else {
+        // Any agent that is awake, hibernating, unknown, or missing from server
+        // lookup is strictly protected so we never delete a recoverable session.
+        protectedFleetIds.add(fleetId)
+      }
+    }
+
+    const protectedSessionTokens = new Set()
+    const protectedPaths = new Set()
+    const candidateDeadSessionTokens = new Set()
+    const candidateDeadPaths = new Set()
+
+    for (const record of localRecords) {
+      const isConfirmedDead = record.fleetId
+        ? confirmedDeadFleetIds.has(record.fleetId) && !protectedFleetIds.has(record.fleetId)
+        : Boolean(record.localDead)
+      const tokens = (record.sessionIds || []).flatMap(normalizeSessionTokens)
+      const paths = (record.sessionPaths || []).filter(Boolean).map(p => path.resolve(p))
+      if (!isConfirmedDead) {
+        for (const token of tokens) protectedSessionTokens.add(token)
+        for (const p of paths) protectedPaths.add(p)
+      } else {
+        for (const token of tokens) candidateDeadSessionTokens.add(token)
+        for (const p of paths) candidateDeadPaths.add(p)
+      }
+    }
+
+    // Protected always wins over dead if two records ever share a session token or path.
+    for (const token of protectedSessionTokens) candidateDeadSessionTokens.delete(token)
+    for (const p of protectedPaths) candidateDeadPaths.delete(p)
+
+    const existingRoots = []
+    for (const root of configRoots) {
+      try {
+        const st = await readStat(root)
+        if (!st?.isDirectory || st.isDirectory()) existingRoots.push(root)
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+    }
+    const openFiles = await listOpenFiles(existingRoots)
+    const observedAt = now()
+    const orphanCutoff = observedAt - orphanMinAgeMs
+    const deadCutoff = observedAt - deadGraceMs
+
+    let removed = 0
+    let removedBytes = 0
+    let removedDead = 0
+    let removedOrphan = 0
+    let retained = 0
+    let retainedBytes = 0
+    const errors = []
+
+    for (const root of existingRoots) {
+      let files = []
+      try {
+        files = await collectRolloutFiles(root)
+      } catch (error) {
+        errors.push(`${root}: ${error?.message || String(error)}`)
+        continue
+      }
+      for (const file of files) {
+        const resolved = path.resolve(file.path)
+        const baseTokens = normalizeSessionTokens(path.basename(file.path, '.jsonl'))
+        const parentTokens = normalizeSessionTokens(path.basename(path.dirname(file.path)))
+        const grandparentTokens = normalizeSessionTokens(path.basename(path.dirname(path.dirname(file.path))))
+        const fileTokens = [...new Set([...baseTokens, ...parentTokens, ...grandparentTokens])]
+
+        const isProtected =
+          openFiles.has(resolved)
+          || protectedPaths.has(resolved)
+          || fileTokens.some(token => protectedSessionTokens.has(token))
+        if (isProtected) {
+          retained += 1
+          retainedBytes += file.size
+          continue
+        }
+
+        const isConfirmedDead =
+          candidateDeadPaths.has(resolved)
+          || fileTokens.some(token => candidateDeadSessionTokens.has(token))
+
+        const eligibleDead = isConfirmedDead && file.mtimeMs < deadCutoff
+        const eligibleOrphan = !isConfirmedDead && file.mtimeMs < orphanCutoff
+        if (!eligibleDead && !eligibleOrphan) {
+          retained += 1
+          retainedBytes += file.size
+          continue
+        }
+
+        // Final content safety check: inspect the rollout header for any fleet:<id>
+        // mention and refuse deletion if it names any non-dead agent.
+        try {
+          const snippet = await readHeaderSnippet(file.path)
+          const mentionedFleetIds = [...new Set((snippet.match(FLEET_ID_TOKEN_RE) || []).map(s => s.toLowerCase()))]
+          const mentionsProtectedOrUnconfirmed = mentionedFleetIds.some(
+            id => protectedFleetIds.has(id) || !confirmedDeadFleetIds.has(id),
+          )
+          if (mentionsProtectedOrUnconfirmed) {
+            retained += 1
+            retainedBytes += file.size
+            continue
+          }
+          await removeFile(file.path)
+          removed += 1
+          removedBytes += file.size
+          if (eligibleDead) removedDead += 1
+          else removedOrphan += 1
+        } catch (error) {
+          if (error?.code === 'ENOENT') continue
+          errors.push(`${file.path}: ${error?.message || String(error)}`)
+        }
+      }
+    }
+
+    return {
+      skippedFailClosed: false,
+      removed,
+      removedBytes,
+      removedDead,
+      removedOrphan,
+      retained,
+      retainedBytes,
+      confirmedDeadAgents: confirmedDeadFleetIds.size,
+      protectedAgents: protectedFleetIds.size,
+      errors,
+    }
+  }
+
+  return { sweep }
 }

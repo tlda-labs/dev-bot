@@ -28,8 +28,25 @@ import {
   parseConfig,
 } from '@tlda/bot'
 import { labelsForAgent, reapIdlePreviews, surveyBotHeartbeats } from '@tlda/bot'
+import {
+  BoxDiskSetupError,
+  collectDiskSample,
+  collectTopDiskConsumers,
+  DEFAULT_DISK_CRITICAL_FREE_BYTES,
+  DEFAULT_DISK_WARN_FREE_BYTES,
+  evaluateDiskSample,
+  formatDiskNotice,
+  formatMiB,
+} from './box-disk.mjs'
 import { BoxMemorySetupError, collectSample as collectBoxMemorySample, createBoxMemoryWatch, formatExcursionNotice } from './box-memory.mjs'
-import { createClimberReaper, createPlaywrightPoolCleanup, createWorktreeCleanup } from './resource-cleanup.mjs'
+import {
+  createClaudeTmpCleanup,
+  createClimberReaper,
+  createConfigLogCleanup,
+  createHarnessRolloutCleanup,
+  createPlaywrightPoolCleanup,
+  createWorktreeCleanup,
+} from './resource-cleanup.mjs'
 import { pathToFileURL as importCheckUrl } from 'node:url'
 import { createGitRemoteProbeDriver, runLinkedRemoteProbe } from './linked-remote-probe.mjs'
 
@@ -224,6 +241,13 @@ function restoreActiveFailure() {
 }
 const playwrightPoolCleanup = createPlaywrightPoolCleanup()
 const worktreeCleanup = createWorktreeCleanup()
+const configLogCleanup = createConfigLogCleanup({ configDir: CONFIG_DIR })
+const claudeTmpCleanup = createClaudeTmpCleanup()
+const harnessRolloutCleanup = createHarnessRolloutCleanup({
+  mintDbPath: DAEMON_MINT_DB,
+  ledgerDbPath: DAEMON_LEDGER_DB,
+  lookupAgentsByIds: ids => lookupAgentsByIds(ids),
+})
 const boxMemoryWatch = createBoxMemoryWatch({
   swapoutWindowMs: BOX_MEMORY_SWAPOUT_WINDOW_MS,
   swapoutRateThresholdPerS: BOX_MEMORY_SWAPOUT_RATE_PER_S,
@@ -2166,7 +2190,7 @@ function compactFailure(results) {
 //
 // A name here with no entry in the table below now reports `degraded` rather
 // than `healthy`. Removing a check is still allowed; removing it silently is not.
-const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'notification-consumption', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup', 'box-memory']
+const REQUIRED_CHECKS = ['doc-load', 'doc-render', 'chat-roundtrip', 'mcp-surface', 'spawn-wake-seat', 'notification-consumption', 'linked-remote-safety', 'agent-receiving', 'misconfigured-agents', 'file-materialization', 'server-imports', 'bot-heartbeats', 'resource-cleanup', 'box-memory', 'box-disk']
 
 // The box-memory watch: Mini memory-pressure signals for the ops team, from
 // ops-oncall's night of hand sampling (swapout rate, top-N by full command
@@ -2235,10 +2259,91 @@ export async function checkBoxMemory({
   throw new Error(notice.join('\n'))
 }
 
+function summarizeCleanupReclaimed(cleanupDetail) {
+  if (!cleanupDetail || typeof cleanupDetail !== 'object') return null
+  if (cleanupDetail.skipped) return `skipped (${cleanupDetail.reason || 'in flight'})`
+  const parts = []
+  if (cleanupDetail.worktrees) {
+    const reclaimedWorktreeBytes = Math.max(
+      0,
+      (Number(cleanupDetail.worktrees.totalBytes) || 0) - (Number(cleanupDetail.worktrees.retainedBytes) || 0),
+    )
+    parts.push(`worktrees evicted=${cleanupDetail.worktrees.evicted || 0} (${formatMiB(reclaimedWorktreeBytes)})`)
+  }
+  if (cleanupDetail.configLogs) {
+    parts.push(`configLogs trimmed=${cleanupDetail.configLogs.trimmedCount || 0} (${formatMiB(cleanupDetail.configLogs.reclaimedBytes || 0)})`)
+  }
+  if (cleanupDetail.claudeTmp) {
+    parts.push(`claudeTmp removed=${cleanupDetail.claudeTmp.removed || 0} (${formatMiB(cleanupDetail.claudeTmp.removedBytes || 0)})`)
+  }
+  if (cleanupDetail.harnessRollouts) {
+    if (cleanupDetail.harnessRollouts.skippedFailClosed) {
+      parts.push(`harnessRollouts=fail-closed (${cleanupDetail.harnessRollouts.reason})`)
+    } else {
+      parts.push(`harnessRollouts removed=${cleanupDetail.harnessRollouts.removed || 0} (${formatMiB(cleanupDetail.harnessRollouts.removedBytes || 0)})`)
+    }
+  }
+  return parts.length ? parts.join(', ') : '0 B reclaimed'
+}
+
+export async function checkBoxDisk({
+  sampleDisk = () => collectDiskSample(),
+  warnFreeBytes = DEFAULT_DISK_WARN_FREE_BYTES,
+  criticalFreeBytes = DEFAULT_DISK_CRITICAL_FREE_BYTES,
+  runCleanup = options => checkResourceCleanup(options),
+  sampleTopConsumers = () => collectTopDiskConsumers(),
+} = {}) {
+  let sample
+  let verdict
+  try {
+    sample = await sampleDisk()
+    verdict = evaluateDiskSample(sample, { warnFreeBytes, criticalFreeBytes })
+  } catch (e) {
+    if (e instanceof BoxDiskSetupError || e?.setupFailure) {
+      throw new ProbeSetupError(`box-disk: ${e.message}`)
+    }
+    throw e
+  }
+
+  if (!verdict.tripped) {
+    return {
+      mountPoint: verdict.mountPoint,
+      freeBytes: verdict.freeBytes,
+      totalBytes: verdict.totalBytes,
+      usedPct: verdict.usedPct,
+      level: verdict.level,
+    }
+  }
+
+  let cleanupDetail = null
+  let cleanupError = null
+  try {
+    cleanupDetail = await runCleanup({
+      forceFullSweep: true,
+      worktreeBudgetBytes: verdict.level === 'critical' ? 0 : undefined,
+    })
+  } catch (e) {
+    cleanupError = e?.message || String(e)
+  }
+
+  const afterSample = await Promise.resolve().then(() => sampleDisk()).catch(() => null)
+  const topConsumers = await Promise.resolve().then(() => sampleTopConsumers()).catch(() => [])
+  const cleanupSummary = cleanupError
+    ? `failed (${cleanupError})`
+    : summarizeCleanupReclaimed(cleanupDetail)
+
+  throw new Error(formatDiskNotice(verdict, { afterSample, cleanupSummary, topConsumers }))
+}
+
 export async function checkResourceCleanup({
   previewReaper = reapIdlePreviews,
   playwrightCleanup = playwrightPoolCleanup,
   worktreeCleanupDriver = worktreeCleanup,
+  configLogCleanupDriver = null,
+  claudeTmpCleanupDriver = null,
+  harnessRolloutCleanupDriver = null,
+  forceFullSweep = false,
+  worktreeBudgetBytes = undefined,
   now = () => Date.now(),
   publish = publishStatus,
 } = {}) {
@@ -2259,20 +2364,24 @@ export async function checkResourceCleanup({
       playwright: results.map(result => ({ session: result.session, state: result.state })),
     }
 
-    if (now() - lastWorktreeCleanupAt >= WORKTREE_CLEANUP_INTERVAL_MS) {
-      const worktrees = await worktreeCleanupDriver.sweep()
+    if (forceFullSweep || now() - lastWorktreeCleanupAt >= WORKTREE_CLEANUP_INTERVAL_MS) {
+      const worktrees = await worktreeCleanupDriver.sweep(
+        worktreeBudgetBytes !== undefined ? { budgetBytes: worktreeBudgetBytes } : undefined,
+      )
       lastWorktreeCleanupAt = now()
-      statusSamples.push({
-        ts: new Date().toISOString(),
-        totalBytes: worktrees.totalBytes,
-        retainedBytes: worktrees.retainedBytes,
-        overBudgetBytes: worktrees.overBudgetBytes,
-        removedWorktrees: worktrees.removedWorktrees.length,
-        evictedCaches: worktrees.evicted.length,
-        pinnedWorktrees: worktrees.pinned.length,
-        abandonedWorktrees: worktrees.abandoned.length,
-      })
-      if (statusSamples.length > 168) statusSamples.splice(0, statusSamples.length - 168)
+      if (typeof statusSamples !== 'undefined' && Array.isArray(statusSamples)) {
+        statusSamples.push({
+          ts: new Date().toISOString(),
+          totalBytes: worktrees.totalBytes,
+          retainedBytes: worktrees.retainedBytes,
+          overBudgetBytes: worktrees.overBudgetBytes,
+          removedWorktrees: worktrees.removedWorktrees.length,
+          evictedCaches: worktrees.evicted.length,
+          pinnedWorktrees: worktrees.pinned.length,
+          abandonedWorktrees: worktrees.abandoned.length,
+        })
+        if (statusSamples.length > 168) statusSamples.splice(0, statusSamples.length - 168)
+      }
       summary.worktrees = {
         removed: worktrees.removedWorktrees.length,
         evicted: worktrees.evicted.length,
@@ -2286,7 +2395,51 @@ export async function checkResourceCleanup({
       for (const entry of worktrees.unremovable) {
         errors.push(`worktree ${entry.path}: ${entry.error || 'could not remove'}`)
       }
-      if (bot?.isCanonical?.()) {
+
+      const useDefaultRetentionDrivers = worktreeCleanupDriver === (typeof worktreeCleanup !== 'undefined' ? worktreeCleanup : null)
+      const effectiveConfigLogDriver = configLogCleanupDriver || (useDefaultRetentionDrivers && typeof configLogCleanup !== 'undefined' ? configLogCleanup : null)
+      if (effectiveConfigLogDriver?.sweep) {
+        const configLogs = await effectiveConfigLogDriver.sweep()
+        summary.configLogs = {
+          trimmedCount: configLogs.trimmedCount,
+          reclaimedBytes: configLogs.reclaimedBytes,
+        }
+        for (const err of configLogs.errors || []) {
+          errors.push(`config-log ${err}`)
+        }
+      }
+
+      const effectiveClaudeTmpDriver = claudeTmpCleanupDriver || (useDefaultRetentionDrivers && typeof claudeTmpCleanup !== 'undefined' ? claudeTmpCleanup : null)
+      if (effectiveClaudeTmpDriver?.sweep) {
+        const claudeTmp = await effectiveClaudeTmpDriver.sweep()
+        summary.claudeTmp = {
+          removed: claudeTmp.removed,
+          removedBytes: claudeTmp.removedBytes,
+          retained: claudeTmp.retained,
+          retainedBytes: claudeTmp.retainedBytes,
+        }
+        for (const err of claudeTmp.errors || []) {
+          errors.push(`claude-tmp ${err}`)
+        }
+      }
+
+      const effectiveHarnessRolloutDriver = harnessRolloutCleanupDriver || (useDefaultRetentionDrivers && typeof harnessRolloutCleanup !== 'undefined' ? harnessRolloutCleanup : null)
+      if (effectiveHarnessRolloutDriver?.sweep) {
+        const harnessRollouts = await effectiveHarnessRolloutDriver.sweep()
+        summary.harnessRollouts = {
+          skippedFailClosed: Boolean(harnessRollouts.skippedFailClosed),
+          ...(harnessRollouts.reason ? { reason: harnessRollouts.reason } : {}),
+          removed: harnessRollouts.removed,
+          removedBytes: harnessRollouts.removedBytes,
+          retained: harnessRollouts.retained,
+          retainedBytes: harnessRollouts.retainedBytes,
+        }
+        for (const err of harnessRollouts.errors || []) {
+          errors.push(`harness-rollout ${err}`)
+        }
+      }
+
+      if (typeof bot !== 'undefined' && bot?.isCanonical?.()) {
         await publish().catch(error => errors.push(`status publish: ${error.message}`))
       }
     }
@@ -2322,6 +2475,7 @@ export function allChecks() {
     ['bot-heartbeats', checkBotHeartbeats],
     ['resource-cleanup', checkResourceCleanup],
     ['box-memory', checkBoxMemory],
+    ['box-disk', checkBoxDisk],
   ]
 }
 
@@ -2381,7 +2535,7 @@ export async function runChecks({ checks = defaultChecks() } = {}) {
 function isNudgeTarget(agent) {
   if (!agent || agent.dead || agent.human || agent.id === OWNER_ID || agent.id === AGENT_ID) return false
   const labels = labelsForAgent(agent)
-  if (labels.includes('bot')) return false
+  if (labels.includes('bot') || labels.includes('human')) return false
   if (agent.id?.startsWith?.('fleet:dev-probe-')) return false
   return true
 }
@@ -2395,19 +2549,29 @@ function isNudgeTarget(agent) {
 // delivery queues until they wake. The fallback is NOT silent -- `fellBack` is
 // carried into the notice text, because a fallback that fixes today and hides
 // tomorrow is how the label rotted unnoticed in the first place.
-async function nudgeTargets() {
-  if (NUDGE_TO_OVERRIDE) return { targets: [NUDGE_TO_OVERRIDE], fellBack: null }
-  if (!NUDGE_LABEL) return { targets: [], fellBack: null }
+export async function nudgeTargets({
+  nudgeToOverride = NUDGE_TO_OVERRIDE,
+  nudgeLabel = NUDGE_LABEL,
+  fleetServer = FLEET_SERVER,
+  requestJson = fetchJson,
+} = {}) {
+  if (nudgeToOverride) {
+    if (nudgeToOverride === OWNER_ID || nudgeToOverride === AGENT_ID) {
+      return { targets: [], fellBack: null }
+    }
+    return { targets: [nudgeToOverride], fellBack: null }
+  }
+  if (!nudgeLabel) return { targets: [], fellBack: null }
   const holders = async filter => {
-    const data = await fetchJson(FLEET_SERVER, `/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`)
+    const data = await requestJson(fleetServer, `/api/fleet-table?filter=${encodeURIComponent(filter)}&limit=500`)
     const agents = Array.isArray(data?.agents) ? data.agents : []
     return agents.filter(isNudgeTarget).map(agent => agent.id)
   }
-  const awake = await holders(`awake & ${NUDGE_LABEL}`)
+  const awake = await holders(`awake & ${nudgeLabel} & !human & !bot`)
   if (awake.length) return { targets: awake, fellBack: null }
-  const asleep = await holders(NUDGE_LABEL)
+  const asleep = await holders(`${nudgeLabel} & !human & !bot`)
   if (!asleep.length) return { targets: [], fellBack: null }
-  return { targets: asleep, fellBack: `no awake holder of \`${NUDGE_LABEL}\`; queued to ${asleep.length} hibernating holder(s)` }
+  return { targets: asleep, fellBack: `no awake holder of \`${nudgeLabel}\`; queued to ${asleep.length} hibernating holder(s)` }
 }
 
 function tmuxPaste(sessionId, message) {
@@ -2429,7 +2593,7 @@ export async function sendNotificationConsumptionTmuxAlarm(report, {
   if (!nudgeLabel) {
     return { ok: false, failureKind: 'alarm-no-recipient', reason: 'no on-call label configured' }
   }
-  const data = await requestJson(fleetServer, `/api/fleet-table?filter=${encodeURIComponent(`awake & ${nudgeLabel}`)}&limit=500`)
+  const data = await requestJson(fleetServer, `/api/fleet-table?filter=${encodeURIComponent(`awake & ${nudgeLabel} & !human & !bot`)}&limit=500`)
   const agents = (Array.isArray(data?.agents) ? data.agents : []).filter(isNudgeTarget)
   if (!agents.length) {
     return { ok: false, failureKind: 'alarm-no-recipient', reason: `no awake holder of ${nudgeLabel}` }

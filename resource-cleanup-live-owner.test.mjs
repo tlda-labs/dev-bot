@@ -2,15 +2,18 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import path from 'node:path'
 import { execFile, spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdtemp, readFile, writeFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import os, { tmpdir } from 'node:os'
 import { promisify } from 'node:util'
 import vm from 'node:vm'
-import { PW_RUNTIME_DIR } from '../../tlda/cli/lib/resource-leases.mjs'
-import { createPlaywrightPoolCleanup, readPlaywrightLockOwner } from './resource-cleanup.mjs'
+import { createPlaywrightPoolCleanup, PW_RUNTIME_DIR, readPlaywrightLockOwner } from './resource-cleanup.mjs'
 
 const execute = promisify(execFile)
-const lockScript = new URL('../../tlda/bin/pw-lock.sh', import.meta.url).pathname
+const relativeLockScript = new URL('../../tlda/bin/pw-lock.sh', import.meta.url).pathname
+const lockScript = existsSync(relativeLockScript)
+  ? relativeLockScript
+  : path.join(os.homedir(), 'work', 'tlda', 'bin', 'pw-lock.sh')
 
 const busy = new Error('Command failed: tlda-dev pw sweep')
 busy.stderr = `lock busy on session "shared-2" — test-owner (174s ago, pid ${process.pid} alive) holding; sweep skipped\n`
