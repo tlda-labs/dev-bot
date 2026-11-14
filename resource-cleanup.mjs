@@ -22,7 +22,6 @@ export const DEFAULT_HEARTBEAT_FILE_RETAIN_BYTES = 128 * 1024
 export const DEFAULT_CONFIG_LOG_MAX_BYTES = 25 * 1024 * 1024
 export const DEFAULT_CONFIG_LOG_RETAIN_BYTES = 5 * 1024 * 1024
 export const DEFAULT_CLAUDE_TMP_MIN_AGE_MS = 4 * 60 * 60_000
-export const DEFAULT_HARNESS_ROLLOUT_ORPHAN_MIN_AGE_MS = 7 * 24 * 60 * 60_000
 export const DEFAULT_HARNESS_ROLLOUT_DEAD_GRACE_MS = 60 * 60_000
 export const PLAYWRIGHT_SWEEP_TIMEOUT_MS = 120_000
 export const PLAYWRIGHT_REAP_TIMEOUT_MS = PLAYWRIGHT_SWEEP_TIMEOUT_MS
@@ -941,7 +940,25 @@ export function createClaudeTmpCleanup({
 }
 
 const UUID_SUFFIX_RE = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/i
-const FLEET_ID_TOKEN_RE = /\bfleet:[a-z0-9_-]{4,}\b/gi
+const SELF_IDENTITY_PATTERNS = [
+  /\[tlda-agent:(fleet:[a-z0-9_-]+)\]/gi,
+  /\bLogged in (fleet:[a-z0-9_-]+)\b/gi,
+  /\\?"(?:fleet_id|agentId|agent_id)\\?"\s*:\s*\\?"(fleet:[a-z0-9_-]+)\\?"/gi,
+  /agent-hook\?agent=fleet(?:%3A|:)([a-z0-9_-]+)\b/gi,
+]
+
+export function extractRolloutSelfFleetIds(snippet) {
+  if (typeof snippet !== 'string' || !snippet) return []
+  const ids = new Set()
+  for (const pattern of SELF_IDENTITY_PATTERNS) {
+    for (const match of snippet.matchAll(pattern)) {
+      const raw = (match[1] || '').toLowerCase()
+      if (!raw) continue
+      ids.add(raw.startsWith('fleet:') ? raw : `fleet:${raw}`)
+    }
+  }
+  return [...ids]
+}
 
 function normalizeSessionTokens(rawId) {
   if (typeof rawId !== 'string' || !rawId.trim()) return []
@@ -957,7 +974,7 @@ function defaultReadLocalAgentRecords({
   ledgerDbPath = path.join(CONFIG_DIR, 'fleet-daemon.db'),
 } = {}) {
   const records = []
-  const mintDb = new DatabaseSync(mintDbPath, { open: true, readOnly: true })
+  const mintDb = new DatabaseSync(mintDbPath, { open: true, readOnly: true, timeout: 5000 })
   try {
     const mintRows = mintDb.prepare(
       'SELECT mint_id, fleet_id, session_id, session_path, provisional_session_id, process_state FROM daemon_mints',
@@ -991,7 +1008,7 @@ function defaultReadLocalAgentRecords({
     mintDb.close()
   }
 
-  const ledgerDb = new DatabaseSync(ledgerDbPath, { open: true, readOnly: true })
+  const ledgerDb = new DatabaseSync(ledgerDbPath, { open: true, readOnly: true, timeout: 5000 })
   try {
     const localRows = ledgerDb.prepare(
       'SELECT a.server_agent_id AS fleet_id, a.dead, c.session_id FROM local_agents a LEFT JOIN local_agent_conversations c ON a.local_agent_id = c.local_agent_id',
@@ -1024,7 +1041,7 @@ function defaultReadLocalAgentRecords({
   return records
 }
 
-async function defaultReadHeaderSnippet(target, maxBytes = 64 * 1024) {
+async function defaultReadHeaderSnippet(target, maxBytes = 256 * 1024) {
   const handle = await open(target, 'r')
   try {
     const buffer = Buffer.allocUnsafe(maxBytes)
@@ -1035,6 +1052,23 @@ async function defaultReadHeaderSnippet(target, maxBytes = 64 * 1024) {
   }
 }
 
+function classifyAgentServerState(agent) {
+  const explicitLabels = new Set(Array.isArray(agent?.labels) ? agent.labels : [])
+  const labels = new Set(labelsForAgent(agent))
+  const runtimeStatus = agent?.runtime_status?.status || null
+  const isDead =
+    Boolean(agent?.dead)
+    || runtimeStatus === 'dead'
+    || (explicitLabels.has('dead') && !explicitLabels.has('awake') && !explicitLabels.has('hibernating') && !runtimeStatus)
+  return labels.has('awake')
+    ? 'awake'
+    : isDead
+      ? 'dead'
+      : labels.has('hibernating')
+        ? 'hibernating'
+        : 'unknown'
+}
+
 export function createHarnessRolloutCleanup({
   run = execFileP,
   configRoots = [
@@ -1043,7 +1077,6 @@ export function createHarnessRolloutCleanup({
   ],
   mintDbPath = path.join(CONFIG_DIR, 'daemon-mints.sqlite'),
   ledgerDbPath = path.join(CONFIG_DIR, 'fleet-daemon.db'),
-  orphanMinAgeMs = DEFAULT_HARNESS_ROLLOUT_ORPHAN_MIN_AGE_MS,
   deadGraceMs = DEFAULT_HARNESS_ROLLOUT_DEAD_GRACE_MS,
   readLocalRecords = () => defaultReadLocalAgentRecords({ mintDbPath, ledgerDbPath }),
   lookupAgentsByIds = null,
@@ -1117,8 +1150,8 @@ export function createHarnessRolloutCleanup({
 
     const fleetIds = [...new Set(
       localRecords
-        .map(record => record.fleetId)
-        .filter(id => typeof id === 'string' && id.startsWith('fleet:')),
+        .map(record => typeof record.fleetId === 'string' ? record.fleetId.trim().toLowerCase() : '')
+        .filter(id => id.startsWith('fleet:')),
     )]
     if (fleetIds.length === 0) {
       return {
@@ -1161,59 +1194,72 @@ export function createHarnessRolloutCleanup({
     const serverStateById = new Map()
     for (const agent of serverAgents) {
       if (!agent?.id) continue
-      const explicitLabels = new Set(Array.isArray(agent.labels) ? agent.labels : [])
-      const labels = new Set(labelsForAgent(agent))
-      const runtimeStatus = agent.runtime_status?.status || null
-      const isDead =
-        Boolean(agent.dead)
-        || runtimeStatus === 'dead'
-        || (explicitLabels.has('dead') && !explicitLabels.has('awake') && !explicitLabels.has('hibernating') && !runtimeStatus)
-      const state = labels.has('awake')
-        ? 'awake'
-        : isDead
-          ? 'dead'
-          : labels.has('hibernating')
-            ? 'hibernating'
-            : 'unknown'
-      serverStateById.set(agent.id, state)
+      serverStateById.set(String(agent.id).toLowerCase(), classifyAgentServerState(agent))
     }
 
     const confirmedDeadFleetIds = new Set()
     const protectedFleetIds = new Set()
-    for (const fleetId of fleetIds) {
-      const serverState = serverStateById.get(fleetId)
+    function recordFleetClassification(fleetId) {
+      const normalized = String(fleetId || '').toLowerCase()
+      if (!normalized) return
+      const serverState = serverStateById.get(normalized)
       if (serverState === 'dead') {
-        confirmedDeadFleetIds.add(fleetId)
+        confirmedDeadFleetIds.add(normalized)
       } else {
         // Any agent that is awake, hibernating, unknown, or missing from server
         // lookup is strictly protected so we never delete a recoverable session.
-        protectedFleetIds.add(fleetId)
+        protectedFleetIds.add(normalized)
+      }
+    }
+    for (const fleetId of fleetIds) {
+      recordFleetClassification(fleetId)
+    }
+
+    async function ensureFleetIdsClassified(ids) {
+      const unknownIds = ids.filter(id => !confirmedDeadFleetIds.has(id) && !protectedFleetIds.has(id))
+      if (unknownIds.length === 0) return
+      try {
+        const fetched = await lookupAgentsByIds(unknownIds)
+        if (Array.isArray(fetched)) {
+          for (const agent of fetched) {
+            if (!agent?.id) continue
+            serverStateById.set(String(agent.id).toLowerCase(), classifyAgentServerState(agent))
+          }
+        }
+      } catch {
+        // Fail closed: any lookup error leaves unknownIds absent from serverStateById,
+        // which classifies them into protectedFleetIds below.
+      }
+      for (const id of unknownIds) {
+        recordFleetClassification(id)
       }
     }
 
-    const protectedSessionTokens = new Set()
-    const protectedPaths = new Set()
-    const candidateDeadSessionTokens = new Set()
-    const candidateDeadPaths = new Set()
+    const dbOwnersBySessionToken = new Map()
+    const dbOwnersByPath = new Map()
+    const unmappedProtectedSessionTokens = new Set()
+    const unmappedProtectedPaths = new Set()
 
     for (const record of localRecords) {
-      const isConfirmedDead = record.fleetId
-        ? confirmedDeadFleetIds.has(record.fleetId) && !protectedFleetIds.has(record.fleetId)
-        : Boolean(record.localDead)
+      const fleetId = typeof record.fleetId === 'string' && record.fleetId.trim().toLowerCase().startsWith('fleet:')
+        ? record.fleetId.trim().toLowerCase()
+        : null
       const tokens = (record.sessionIds || []).flatMap(normalizeSessionTokens)
       const paths = (record.sessionPaths || []).filter(Boolean).map(p => path.resolve(p))
-      if (!isConfirmedDead) {
-        for (const token of tokens) protectedSessionTokens.add(token)
-        for (const p of paths) protectedPaths.add(p)
-      } else {
-        for (const token of tokens) candidateDeadSessionTokens.add(token)
-        for (const p of paths) candidateDeadPaths.add(p)
+      if (fleetId) {
+        for (const token of tokens) {
+          if (!dbOwnersBySessionToken.has(token)) dbOwnersBySessionToken.set(token, new Set())
+          dbOwnersBySessionToken.get(token).add(fleetId)
+        }
+        for (const p of paths) {
+          if (!dbOwnersByPath.has(p)) dbOwnersByPath.set(p, new Set())
+          dbOwnersByPath.get(p).add(fleetId)
+        }
+      } else if (!record.localDead) {
+        for (const token of tokens) unmappedProtectedSessionTokens.add(token)
+        for (const p of paths) unmappedProtectedPaths.add(p)
       }
     }
-
-    // Protected always wins over dead if two records ever share a session token or path.
-    for (const token of protectedSessionTokens) candidateDeadSessionTokens.delete(token)
-    for (const p of protectedPaths) candidateDeadPaths.delete(p)
 
     const existingRoots = []
     for (const root of configRoots) {
@@ -1226,16 +1272,16 @@ export function createHarnessRolloutCleanup({
     }
     const openFiles = await listOpenFiles(existingRoots)
     const observedAt = now()
-    const orphanCutoff = observedAt - orphanMinAgeMs
     const deadCutoff = observedAt - deadGraceMs
 
     let removed = 0
     let removedBytes = 0
     let removedDead = 0
-    let removedOrphan = 0
     let retained = 0
     let retainedBytes = 0
     const errors = []
+    const candidates = []
+    const allHeaderSelfIds = new Set()
 
     for (const root of existingRoots) {
       let files = []
@@ -1252,50 +1298,64 @@ export function createHarnessRolloutCleanup({
         const grandparentTokens = normalizeSessionTokens(path.basename(path.dirname(path.dirname(file.path))))
         const fileTokens = [...new Set([...baseTokens, ...parentTokens, ...grandparentTokens])]
 
-        const isProtected =
+        const dbOwners = new Set()
+        const pathOwners = dbOwnersByPath.get(resolved)
+        if (pathOwners) {
+          for (const id of pathOwners) dbOwners.add(id)
+        }
+        for (const token of fileTokens) {
+          const tokenOwners = dbOwnersBySessionToken.get(token)
+          if (tokenOwners) {
+            for (const id of tokenOwners) dbOwners.add(id)
+          }
+        }
+
+        const isImmediatelyProtected =
           openFiles.has(resolved)
-          || protectedPaths.has(resolved)
-          || fileTokens.some(token => protectedSessionTokens.has(token))
-        if (isProtected) {
+          || file.mtimeMs >= deadCutoff
+          || unmappedProtectedPaths.has(resolved)
+          || fileTokens.some(token => unmappedProtectedSessionTokens.has(token))
+          || [...dbOwners].some(id => protectedFleetIds.has(id) || !confirmedDeadFleetIds.has(id))
+        if (isImmediatelyProtected) {
           retained += 1
           retainedBytes += file.size
           continue
         }
 
-        const isConfirmedDead =
-          candidateDeadPaths.has(resolved)
-          || fileTokens.some(token => candidateDeadSessionTokens.has(token))
-
-        const eligibleDead = isConfirmedDead && file.mtimeMs < deadCutoff
-        const eligibleOrphan = !isConfirmedDead && file.mtimeMs < orphanCutoff
-        if (!eligibleDead && !eligibleOrphan) {
-          retained += 1
-          retainedBytes += file.size
-          continue
-        }
-
-        // Final content safety check: inspect the rollout header for any fleet:<id>
-        // mention and refuse deletion if it names any non-dead agent.
         try {
           const snippet = await readHeaderSnippet(file.path)
-          const mentionedFleetIds = [...new Set((snippet.match(FLEET_ID_TOKEN_RE) || []).map(s => s.toLowerCase()))]
-          const mentionsProtectedOrUnconfirmed = mentionedFleetIds.some(
-            id => protectedFleetIds.has(id) || !confirmedDeadFleetIds.has(id),
-          )
-          if (mentionsProtectedOrUnconfirmed) {
-            retained += 1
-            retainedBytes += file.size
-            continue
-          }
-          await removeFile(file.path)
-          removed += 1
-          removedBytes += file.size
-          if (eligibleDead) removedDead += 1
-          else removedOrphan += 1
+          const headerSelfFleetIds = extractRolloutSelfFleetIds(snippet)
+          for (const id of headerSelfFleetIds) allHeaderSelfIds.add(id)
+          candidates.push({
+            file,
+            ownerFleetIds: new Set([...dbOwners, ...headerSelfFleetIds]),
+          })
         } catch (error) {
           if (error?.code === 'ENOENT') continue
           errors.push(`${file.path}: ${error?.message || String(error)}`)
         }
+      }
+    }
+
+    await ensureFleetIdsClassified([...allHeaderSelfIds])
+
+    for (const { file, ownerFleetIds } of candidates) {
+      const isConfirmedDeadOnly =
+        ownerFleetIds.size >= 1
+        && [...ownerFleetIds].every(id => confirmedDeadFleetIds.has(id) && !protectedFleetIds.has(id))
+      if (!isConfirmedDeadOnly) {
+        retained += 1
+        retainedBytes += file.size
+        continue
+      }
+      try {
+        await removeFile(file.path)
+        removed += 1
+        removedBytes += file.size
+        removedDead += 1
+      } catch (error) {
+        if (error?.code === 'ENOENT') continue
+        errors.push(`${file.path}: ${error?.message || String(error)}`)
       }
     }
 
@@ -1304,7 +1364,6 @@ export function createHarnessRolloutCleanup({
       removed,
       removedBytes,
       removedDead,
-      removedOrphan,
       retained,
       retainedBytes,
       confirmedDeadAgents: confirmedDeadFleetIds.size,

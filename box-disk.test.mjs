@@ -20,10 +20,10 @@ import {
   DEFAULT_CLAUDE_TMP_MIN_AGE_MS,
   DEFAULT_CONFIG_LOG_MAX_BYTES,
   DEFAULT_CONFIG_LOG_RETAIN_BYTES,
-  DEFAULT_HARNESS_ROLLOUT_ORPHAN_MIN_AGE_MS,
   DEFAULT_HEARTBEAT_FILE_MAX_BYTES,
   DEFAULT_HEARTBEAT_FILE_RETAIN_BYTES,
   DEFAULT_WORKTREE_NODE_MODULES_BUDGET_BYTES,
+  extractRolloutSelfFleetIds,
 } from './resource-cleanup.mjs'
 
 process.env.TLDA_DEV_BOT_NO_START = '1'
@@ -348,8 +348,20 @@ test('createHarnessRolloutCleanup fails closed when local DB or server lookup fa
   assert.deepEqual(removed, [])
 })
 
-test('createHarnessRolloutCleanup strictly preserves awake and hibernating sessions (including via header content check) and prunes only confirmed dead or >7d orphan rollouts', async () => {
-  assert.equal(DEFAULT_HARNESS_ROLLOUT_ORPHAN_MIN_AGE_MS, 7 * 24 * 60 * 60_000)
+test('extractRolloutSelfFleetIds matches only authoritative self-identity markers and ignores task IDs, fleet:skip, and peer/PM chat mentions', () => {
+  const kickoffAndLoginSnippet = [
+    '{"type":"user","message":"--- [tlda-agent:fleet:df93956a] Check inbox(). Task [fleet:66e4-mui8ba3j] from fleet:daac9052 per fleet:skip ruling."}',
+    '{"type":"tool_result","content":"Logged in fleet:df93956a.\\n{\\"fleet_id\\":\\"fleet:df93956a\\"}"}',
+    '{"hook":"http://127.0.0.1:8765/api/agent-hook?agent=fleet%3Adf93956a"}',
+  ].join('\n')
+  assert.deepEqual(extractRolloutSelfFleetIds(kickoffAndLoginSnippet), ['fleet:df93956a'])
+  assert.deepEqual(
+    extractRolloutSelfFleetIds('Task fleet:66e4-mui8ba3j delegated by fleet:daac9052 for fleet:skip'),
+    [],
+  )
+})
+
+test('createHarnessRolloutCleanup prunes only rollouts whose owning agents are all confirmed dead and retains awake, hibernating, and unowned orphan rollouts', async () => {
   const nowMs = 20_000_000_000
   const twoHoursAgo = nowMs - 2 * 60 * 60_000
   const tenDaysAgo = nowMs - 10 * 24 * 60 * 60_000
@@ -357,14 +369,16 @@ test('createHarnessRolloutCleanup strictly preserves awake and hibernating sessi
   const awakeUuid = '11111111-1111-4111-8111-111111111111'
   const hibernatingUuid = '22222222-2222-4222-8222-222222222222'
   const deadUuid = '33333333-3333-4333-8333-333333333333'
-  const orphanDeadContentUuid = '44444444-4444-4444-8444-444444444444'
-  const orphanHibernatingContentUuid = '55555555-5555-4555-8555-555555555555'
+  const headerOwnedDeadUuid = '44444444-4444-4444-8444-444444444444'
+  const headerOwnedHibernatingUuid = '55555555-5555-4555-8555-555555555555'
+  const unownedOrphanUuid = '66666666-6666-4666-8666-666666666666'
 
   const awakePath = `/configs/app/codex/sessions/2026/11/01/rollout-2026-11-01T00-00-00-${awakeUuid}.jsonl`
   const hibernatingPath = `/configs/app/claude/projects/-Users-skip-work-tlda/${hibernatingUuid}.jsonl`
   const deadPath = `/configs/app/codex/sessions/2026/11/01/rollout-2026-11-01T00-00-00-${deadUuid}.jsonl`
-  const orphanSafeToDeletePath = `/configs/app/claude/projects/-Users-skip-work-tlda/${orphanDeadContentUuid}.jsonl`
-  const orphanMentionsHibernatingPath = `/configs/app/claude/projects/-Users-skip-work-tlda/${orphanHibernatingContentUuid}.jsonl`
+  const headerOwnedDeadPath = `/configs/app/claude/projects/-Users-skip-work-tlda/${headerOwnedDeadUuid}.jsonl`
+  const headerOwnedHibernatingPath = `/configs/app/claude/projects/-Users-skip-work-tlda/${headerOwnedHibernatingUuid}.jsonl`
+  const unownedOrphanPath = `/configs/app/claude/projects/-Users-skip-work-tlda/${unownedOrphanUuid}.jsonl`
 
   const tree = {
     '/configs': ['app'],
@@ -378,8 +392,9 @@ test('createHarnessRolloutCleanup strictly preserves awake and hibernating sessi
     '/configs/app/claude/projects': ['-Users-skip-work-tlda'],
     '/configs/app/claude/projects/-Users-skip-work-tlda': [
       path.basename(hibernatingPath),
-      path.basename(orphanSafeToDeletePath),
-      path.basename(orphanMentionsHibernatingPath),
+      path.basename(headerOwnedDeadPath),
+      path.basename(headerOwnedHibernatingPath),
+      path.basename(unownedOrphanPath),
     ],
   }
 
@@ -387,15 +402,20 @@ test('createHarnessRolloutCleanup strictly preserves awake and hibernating sessi
     [awakePath]: { size: 100, mtimeMs: tenDaysAgo },
     [hibernatingPath]: { size: 200, mtimeMs: tenDaysAgo },
     [deadPath]: { size: 300, mtimeMs: twoHoursAgo },
-    [orphanSafeToDeletePath]: { size: 400, mtimeMs: tenDaysAgo },
-    [orphanMentionsHibernatingPath]: { size: 500, mtimeMs: tenDaysAgo },
+    [headerOwnedDeadPath]: { size: 400, mtimeMs: tenDaysAgo },
+    [headerOwnedHibernatingPath]: { size: 500, mtimeMs: tenDaysAgo },
+    [unownedOrphanPath]: { size: 600, mtimeMs: tenDaysAgo },
   }
 
   const headers = {
-    [deadPath]: '[tlda-agent:fleet:dead-agent]',
-    [orphanSafeToDeletePath]: 'no fleet id or [tlda-agent:fleet:dead-agent]',
-    // Counterfactual: unindexed rollout file on disk whose header names a hibernating agent MUST be spared!
-    [orphanMentionsHibernatingPath]: '[tlda-agent:fleet:hibernating-agent]',
+    // Confirmed-dead rollout that mentions fleet:skip, delegating PM fleet:awake-agent, and task ID fleet:66e4-mui8ba3j in prose MUST still be pruned!
+    [deadPath]: '[tlda-agent:fleet:dead-agent] Task fleet:66e4-mui8ba3j delegated by fleet:awake-agent for fleet:skip. Logged in fleet:dead-agent.',
+    // Unindexed rollout whose self-identity is confirmed dead on the server is pruned:
+    [headerOwnedDeadPath]: '{"content":"Logged in fleet:dead-agent.\\n{\\"fleet_id\\":\\"fleet:dead-agent\\"}"}',
+    // Unindexed rollout whose self-identity names a hibernating agent MUST be spared:
+    [headerOwnedHibernatingPath]: '[tlda-agent:fleet:hibernating-agent]',
+    // Unindexed >10d orphan rollout with NO confirmed-dead owner MUST be spared (fail-closed):
+    [unownedOrphanPath]: 'plain transcript with no self-identity and task mention fleet:66e4-mui8ba3j',
   }
 
   const removed = []
@@ -426,13 +446,14 @@ test('createHarnessRolloutCleanup strictly preserves awake and hibernating sessi
 
   const result = await cleanup.sweep()
   assert.equal(result.skippedFailClosed, false)
-  assert.deepEqual(removed, [deadPath, orphanSafeToDeletePath])
-  assert.equal(result.removedDead, 1)
-  assert.equal(result.removedOrphan, 1)
-  assert.equal(result.retained, 3)
+  assert.deepEqual(removed, [deadPath, headerOwnedDeadPath])
+  assert.equal(result.removed, 2)
+  assert.equal(result.removedDead, 2)
+  assert.equal(result.retained, 4)
   assert.equal(removed.includes(awakePath), false)
   assert.equal(removed.includes(hibernatingPath), false)
-  assert.equal(removed.includes(orphanMentionsHibernatingPath), false)
+  assert.equal(removed.includes(headerOwnedHibernatingPath), false)
+  assert.equal(removed.includes(unownedOrphanPath), false)
 })
 
 test('checkResourceCleanup runs retention drivers when forceFullSweep is true', async () => {
