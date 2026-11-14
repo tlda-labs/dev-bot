@@ -1,6 +1,6 @@
 import { execFile } from 'child_process'
 import { existsSync } from 'fs'
-import { open, readdir, readFile, rm, stat, utimes, writeFile } from 'fs/promises'
+import { lstat, open, readdir, readFile, rm, stat, utimes, writeFile } from 'fs/promises'
 import os from 'os'
 import path from 'path'
 import { DatabaseSync } from 'node:sqlite'
@@ -840,17 +840,34 @@ async function defaultOpenFilesUnder(run, roots) {
   }
 }
 
-async function walkFilesRecursive(dir, listEntries, readStat) {
+async function walkFilesRecursive(rootDir, listEntries, readStat) {
   const files = []
-  let entries = []
-  try {
-    entries = await listEntries(dir)
-  } catch (error) {
-    if (error?.code === 'ENOENT') return files
-    throw error
-  }
-  for (const name of entries) {
-    const full = path.join(dir, name)
+  const stack = [{ dir: rootDir, entries: null, index: 0 }]
+  while (stack.length > 0) {
+    const frame = stack[stack.length - 1]
+    if (frame.entries === null) {
+      try {
+        frame.entries = await listEntries(frame.dir)
+      } catch (error) {
+        if (error?.code === 'ENOENT') {
+          stack.pop()
+          continue
+        }
+        throw error
+      }
+    }
+    if (frame.index >= frame.entries.length) {
+      stack.pop()
+      continue
+    }
+    const entry = frame.entries[frame.index]
+    frame.index += 1
+    const name = typeof entry === 'string' ? entry : entry?.name
+    if (!name) continue
+    if (typeof entry === 'object' && typeof entry?.isSymbolicLink === 'function' && entry.isSymbolicLink()) {
+      continue
+    }
+    const full = path.join(frame.dir, name)
     let metadata
     try {
       metadata = await readStat(full)
@@ -858,9 +875,10 @@ async function walkFilesRecursive(dir, listEntries, readStat) {
       if (error?.code === 'ENOENT') continue
       throw error
     }
+    if (!metadata) continue
     if (typeof metadata?.isSymbolicLink === 'function' && metadata.isSymbolicLink()) continue
     if (typeof metadata?.isDirectory === 'function' && metadata.isDirectory()) {
-      files.push(...await walkFilesRecursive(full, listEntries, readStat))
+      stack.push({ dir: full, entries: null, index: 0 })
     } else if (typeof metadata?.isFile !== 'function' || metadata.isFile()) {
       files.push({ path: full, size: metadata.size || 0, mtimeMs: metadata.mtimeMs || 0 })
     }
@@ -873,7 +891,7 @@ export function createClaudeTmpCleanup({
   tmpRoot = '/private/tmp',
   minAgeMs = DEFAULT_CLAUDE_TMP_MIN_AGE_MS,
   listEntries = readdir,
-  readStat = stat,
+  readStat = lstat,
   removeFile = target => rm(target, { force: true }),
   listOpenFiles = roots => defaultOpenFilesUnder(run, roots),
   now = () => Date.now(),
@@ -1081,7 +1099,7 @@ export function createHarnessRolloutCleanup({
   readLocalRecords = () => defaultReadLocalAgentRecords({ mintDbPath, ledgerDbPath }),
   lookupAgentsByIds = null,
   listEntries = readdir,
-  readStat = stat,
+  readStat = lstat,
   readHeaderSnippet = defaultReadHeaderSnippet,
   removeFile = target => rm(target, { force: true }),
   listOpenFiles = roots => defaultOpenFilesUnder(run, roots),

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -307,6 +307,103 @@ test('createClaudeTmpCleanup removes expired files in /private/tmp/claude-* and 
   assert.equal(result.retained, 2)
   assert.equal(result.retainedBytes, 5000)
   assert.deepEqual(result.errors, [])
+})
+
+test('createClaudeTmpCleanup skips symlink loops via default lstat and handles >70k files and deep trees without stack overflow', async () => {
+  // 1. Real filesystem symlink loop + external symlink target protection using default readStat (lstat)
+  const dir = await mkdtemp(path.join(tmpdir(), 'tlda-claude-tmp-symlink-'))
+  try {
+    const claudeRoot = path.join(dir, 'claude-501')
+    const subDir = path.join(claudeRoot, 'scratchpad')
+    const externalDir = path.join(dir, 'external-protected')
+    await mkdir(subDir, { recursive: true })
+    await mkdir(externalDir, { recursive: true })
+
+    const expiredFile = path.join(subDir, 'expired.txt')
+    const protectedExternalFile = path.join(externalDir, 'keep.txt')
+    await writeFile(expiredFile, 'old-data', 'utf8')
+    await writeFile(protectedExternalFile, 'external-data', 'utf8')
+
+    const pastDate = new Date(Date.now() - DEFAULT_CLAUDE_TMP_MIN_AGE_MS - 120_000)
+    await utimes(expiredFile, pastDate, pastDate)
+    await utimes(protectedExternalFile, pastDate, pastDate)
+
+    // Create a symlink loop back to parent and a symlink to an external directory
+    await symlink(claudeRoot, path.join(subDir, 'loop-to-root'))
+    await symlink(externalDir, path.join(subDir, 'external-link'))
+
+    // Counterfactual: using `stat` instead of `lstat` follows `loop-to-root` infinitely
+    let statDepthExceeded = false
+    const buggyCleanup = createClaudeTmpCleanup({
+      tmpRoot: dir,
+      readStat: async target => {
+        if (target.split('loop-to-root').length > 8) {
+          statDepthExceeded = true
+          throw new Error('symlink loop followed by stat')
+        }
+        return stat(target)
+      },
+      listOpenFiles: async () => new Set(),
+    })
+    const buggyResult = await buggyCleanup.sweep()
+    assert.equal(statDepthExceeded, true)
+    assert.equal(buggyResult.errors.length, 1)
+
+    // Default readStat (lstat) skips symlinks cleanly, removes expiredFile, and never touches externalDir
+    const cleanup = createClaudeTmpCleanup({
+      tmpRoot: dir,
+      listOpenFiles: async () => new Set(),
+    })
+    const result = await cleanup.sweep()
+    assert.deepEqual(result.errors, [])
+    assert.equal(result.removed, 1)
+    assert.equal(await readFile(protectedExternalFile, 'utf8'), 'external-data')
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+
+  // 2. Wide (>130,000 files in a subdirectory, which overflows Array.prototype.push(...spread)) + deep (200 levels)
+  const nowMs = 10_000_000_000
+  const oldMs = nowMs - DEFAULT_CLAUDE_TMP_MIN_AGE_MS - 60_000
+  const wideCount = 150_000
+  const wideEntries = Array.from({ length: wideCount }, (_, i) => `f-${i}.tmp`)
+
+  // Counterfactual: spreading wideEntries into push throws RangeError: Maximum call stack size exceeded in V8
+  assert.throws(() => {
+    const arr = []
+    arr.push(...wideEntries)
+  }, RangeError)
+
+  const deepDepth = 200
+  const tree = {
+    '/private/tmp': ['claude-501'],
+    '/private/tmp/claude-501': ['wide', 'deep-0'],
+    '/private/tmp/claude-501/wide': wideEntries,
+  }
+  for (let d = 0; d < deepDepth; d += 1) {
+    const cur = `/private/tmp/claude-501/${Array.from({ length: d + 1 }, (_, i) => `deep-${i}`).join('/')}`
+    tree[cur] = d + 1 < deepDepth ? [`deep-${d + 1}`] : ['leaf.tmp']
+  }
+
+  let removedCount = 0
+  const wideCleanup = createClaudeTmpCleanup({
+    tmpRoot: '/private/tmp',
+    now: () => nowMs,
+    listEntries: async d => tree[d] || [],
+    readStat: async target => {
+      if (target === '/private/tmp/claude-501' || target === '/private/tmp/claude-501/wide' || target.includes('/deep-') && !target.endsWith('.tmp')) {
+        return { isSymbolicLink: () => false, isDirectory: () => true, isFile: () => false }
+      }
+      return { isSymbolicLink: () => false, isDirectory: () => false, isFile: () => true, size: 10, mtimeMs: oldMs }
+    },
+    listOpenFiles: async () => new Set(),
+    removeFile: async () => { removedCount += 1 },
+  })
+
+  const wideResult = await wideCleanup.sweep()
+  assert.deepEqual(wideResult.errors, [])
+  assert.equal(wideResult.removed, wideCount + 1)
+  assert.equal(removedCount, wideCount + 1)
 })
 
 test('createHarnessRolloutCleanup fails closed when local DB or server lookup fails or returns empty', async () => {
