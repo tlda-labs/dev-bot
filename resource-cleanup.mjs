@@ -936,6 +936,16 @@ export function createClaudeTmpCleanup({
       }
       for (const file of files) {
         const resolved = path.resolve(file.path)
+        // A session's scratchpad is its working memory, written once and read
+        // hours later; it is never held open, so age and open-file checks
+        // cannot tell a live session's notes from abandoned ones. Claude Code
+        // owns that directory's lifetime. Only task outputs and loose files
+        // are swept here.
+        if (resolved.split(path.sep).includes('scratchpad')) {
+          retained += 1
+          retainedBytes += file.size
+          continue
+        }
         if (file.mtimeMs >= cutoff || openFiles.has(resolved)) {
           retained += 1
           retainedBytes += file.size

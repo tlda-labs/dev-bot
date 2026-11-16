@@ -276,11 +276,18 @@ test('createClaudeTmpCleanup removes expired files in /private/tmp/claude-* and 
 
   const tree = {
     '/private/tmp': ['claude-501', 'claude-top-old.html', 'unrelated-dir'],
-    '/private/tmp/claude-501': ['tasks'],
+    '/private/tmp/claude-501': ['tasks', 'proj'],
     '/private/tmp/claude-501/tasks': ['old.output', 'open.output', 'fresh.output'],
+    '/private/tmp/claude-501/proj': ['session'],
+    '/private/tmp/claude-501/proj/session': ['scratchpad'],
+    '/private/tmp/claude-501/proj/session/scratchpad': ['ledger.md'],
   }
   const stats = {
     '/private/tmp/claude-501': { isDirectory: () => true, isFile: () => false },
+    '/private/tmp/claude-501/proj': { isDirectory: () => true, isFile: () => false },
+    '/private/tmp/claude-501/proj/session': { isDirectory: () => true, isFile: () => false },
+    '/private/tmp/claude-501/proj/session/scratchpad': { isDirectory: () => true, isFile: () => false },
+    '/private/tmp/claude-501/proj/session/scratchpad/ledger.md': { isDirectory: () => false, isFile: () => true, size: 700, mtimeMs: oldMs },
     '/private/tmp/claude-501/tasks': { isDirectory: () => true, isFile: () => false },
     '/private/tmp/claude-501/tasks/old.output': { isDirectory: () => false, isFile: () => true, size: 1000, mtimeMs: oldMs },
     '/private/tmp/claude-501/tasks/open.output': { isDirectory: () => false, isFile: () => true, size: 2000, mtimeMs: oldMs },
@@ -304,8 +311,8 @@ test('createClaudeTmpCleanup removes expired files in /private/tmp/claude-* and 
   ])
   assert.equal(result.removed, 2)
   assert.equal(result.removedBytes, 1500)
-  assert.equal(result.retained, 2)
-  assert.equal(result.retainedBytes, 5000)
+  assert.equal(result.retained, 3, 'an old scratchpad file of a session is kept')
+  assert.equal(result.retainedBytes, 5700)
   assert.deepEqual(result.errors, [])
 })
 
@@ -314,7 +321,7 @@ test('createClaudeTmpCleanup skips symlink loops via default lstat and handles >
   const dir = await mkdtemp(path.join(tmpdir(), 'tlda-claude-tmp-symlink-'))
   try {
     const claudeRoot = path.join(dir, 'claude-501')
-    const subDir = path.join(claudeRoot, 'scratchpad')
+    const subDir = path.join(claudeRoot, 'tasks')
     const externalDir = path.join(dir, 'external-protected')
     await mkdir(subDir, { recursive: true })
     await mkdir(externalDir, { recursive: true })
