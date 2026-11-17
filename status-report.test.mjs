@@ -4,10 +4,11 @@ import test from 'node:test'
 
 process.env.TLDA_DEV_BOT_NO_START = '1'
 const {
+  checkResourceCleanup,
+  commands,
   configSchema,
   parseMiniLoadCsv,
   publishMiniLoadReport,
-  publishStatus,
   renderMiniLoadCsv,
   renderMiniLoadQmd,
   renderStatusMarkdown,
@@ -43,25 +44,35 @@ test('status Markdown is semantic, labeled, timestamped, provenance-bearing, and
   assert.match(report, /Provenance:/)
   assert.match(report, /2026-07-30T05:00:00\.000Z/)
   assert.match(report, /<svg[\s\S]*<title>/)
-  assert.match(report, /^# Dev bot disk and worktree status \{\.volatile\}/)
+  assert.match(report, /^# Dev bot disk and worktree status\n/)
 })
 
-test('status publication uses the info project source pipeline and exposes failure', async () => {
-  let request
-  const transport = {
-    sendAndWait: async message => {
-      request = message
-      return { ok: true }
-    },
-  }
-  assert.match(await publishStatus({ transport, samples: [] }), /^\[Dev bot disk and worktree status\]\(\/docs\/info\//)
-  assert.equal(request.type, 'source-change')
-  assert.equal(request.project, 'info')
-  assert.equal(request.files[0].path, 'dev-bot-status.md')
-  assert.match(request.files[0].content, /\{\.volatile\}/)
+test('status replies inline with the latest completed cleanup and exposes reply failure', async () => {
+  const cleanup = await checkResourceCleanup({
+    previewReaper: () => ({ reaped: [], failed: [] }),
+    playwrightCleanup: { sweep: async () => [] },
+    worktreeCleanupDriver: { sweep: async () => ({
+      totalBytes: 4096, retainedBytes: 2048, overBudgetBytes: 0,
+      removedWorktrees: [{}], evicted: [{}, {}], pinned: [], abandoned: [], unremovable: [],
+    }) },
+    forceFullSweep: true,
+  })
+  assert.equal(cleanup.worktrees.retainedBytes, 2048)
+  const status = commands.find(command => command.name === 'status')
+  const replies = []
+  await status.handler({ reply: async message => replies.push(message) })
+  assert.equal(replies.length, 1)
+  assert.match(replies[0], /^# Dev bot disk and worktree status\n/)
+  assert.match(replies[0], /The latest sweep retained 2\.0 KiB/)
+  assert.match(replies[0], /1 merged clean worktree\(s\) and 2 cache\(s\)/)
+  assert.match(replies[0], /\| Timestamp \| Total caches \|/)
+  assert.match(replies[0], /Generated: \d{4}-/)
+  assert.match(replies[0], /Provenance:/)
+  assert.doesNotMatch(replies[0], /\/docs\/info\/|\{\.volatile\}/)
+  assert.equal(configSchema.fields.statusFile, undefined)
 
   await assert.rejects(
-    publishStatus({ transport: { sendAndWait: async () => ({ ok: false, error: 'refused' }) }, samples: [] }),
+    status.handler({ reply: async () => { throw new Error('refused') } }),
     /refused/,
   )
 })

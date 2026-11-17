@@ -270,7 +270,7 @@ test('actual caller reports acquire and release failures through the existing er
   })
   const invoke = sweep => check({
     previewReaper: () => ({ reaped: [], failed: [] }),
-    playwrightCleanup: { sweep }, worktreeCleanupDriver: {}, now: () => 0, publish: async () => {},
+    playwrightCleanup: { sweep }, worktreeCleanupDriver: {}, now: () => 0,
   })
   for (const empty of [false, true]) {
     const control = await actualLockControl(t, { empty, acquisitionOutcomeFails: true, acquireErrorCode: 1, releaseFails: true })

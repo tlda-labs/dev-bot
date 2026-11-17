@@ -256,7 +256,6 @@ const cleanup = await checkResourceCleanup({
     unremovable: [],
   }) },
   now: () => 1,
-  publish: async () => {},
 })
 let strayStillExists = true
 try {

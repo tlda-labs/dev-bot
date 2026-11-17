@@ -11,7 +11,7 @@ merged clean worktrees, and over-budget worktree dependency caches.
 
 Its authority is limited to its configured non-stable environment, disposable
 probe agents and tasks, configured failure-notice recipients, local cleanup
-eligibility rules, and its report file in the ordinary `info` project. It does not deploy,
+eligibility rules, and inline status replies. It does not deploy,
 modify stable environments, clean dirty or active worktrees, or create a
 separate artifact store.
 
@@ -20,8 +20,7 @@ separate artifact store.
 Inputs are fleet and project API responses, local worktree/process/disk
 measurements, chat commands, and the configuration below. Outputs are structured
 logs, an append-only heartbeat, bounded failure notices, cleanup actions, and a
-volatile semantic Markdown status report with an additional interactive SVG
-timeline.
+Markdown status report returned inline in chat, with an additional SVG timeline.
 
 Persistent state consists of the fleet identity file and heartbeat. The
 supervisor owns the process and PID file. Failure-notice cooldown and timeline
@@ -33,9 +32,9 @@ cleanup or probe; normal schedules self-correct.
 <!-- BEGIN GENERATED COMMANDS -->
 ### `status`
 
-Publish and return the current disk/worktree status report.
+Return the current disk/worktree status report inline.
 
-Writes the current semantic Markdown report and interactive timeline to the ordinary info project through the normal source-change pipeline, then returns its project-file reference.
+Replies with the current Markdown report, cleanup measurements, and timeline in chat.
 
 Examples:
 
@@ -83,7 +82,6 @@ The runtime validator and this section use the same schema.
 - `TLDA_DEV_BOT_NUDGE_DRY_RUN` (nudgeDryRun; default: `false`) — Record but do not send failure notices.
 - `TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS` (resourceCleanupIntervalMs; default: `60000`) — Playwright cleanup cadence.
 - `TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS` (worktreeCleanupIntervalMs; default: `3600000`) — Worktree cleanup cadence.
-- `TLDA_DEV_BOT_STATUS_FILE` (statusFile; default: `"dev-bot-status.md"`) — Project-relative volatile status Markdown path.
 - `TLDA_DEV_BOT_LOAD_REPORT_PROJECT` (loadReportProject; default: `"mini-load"`) — Project name for the live Mini load OJS report.
 - `TLDA_DEV_BOT_LOAD_REPORT_SOURCE_FILE` (loadReportSourceFile; default: `"index.qmd"`) — Main QMD file for the live Mini load OJS report.
 - `TLDA_DEV_BOT_LOAD_REPORT_DATA_FILE` (loadReportDataFile; default: `"mini-load.csv"`) — CSV source file appended by the live Mini load OJS report publisher.
@@ -151,5 +149,5 @@ npm run test:red
 TLDA_DEV_BOT_NO_START=1 node generate-docs.mjs --check
 ```
 
-The remaining live proof is supervisor-owned login and heartbeat, `help`, one
-`status` command, and the browser-visible rendered status document.
+Live verification covers supervisor-owned login and heartbeat, `help`, an inline
+`status` reply, and a completed cleanup recorded in the heartbeat.

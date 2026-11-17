@@ -104,7 +104,6 @@ export const configSchema = defineConfig({
   nudgeDryRun: { env: 'TLDA_DEV_BOT_NUDGE_DRY_RUN', default: false, description: 'Record but do not send failure notices.', parse: configTypes.boolean },
   resourceCleanupIntervalMs: { env: 'TLDA_DEV_BOT_RESOURCE_CLEANUP_INTERVAL_MS', default: 60_000, description: 'Playwright cleanup cadence.', parse: configTypes.integer, validate: positive },
   worktreeCleanupIntervalMs: { env: 'TLDA_DEV_BOT_WORKTREE_CLEANUP_INTERVAL_MS', default: 3_600_000, description: 'Worktree cleanup cadence.', parse: configTypes.integer, validate: positive },
-  statusFile: { env: 'TLDA_DEV_BOT_STATUS_FILE', default: 'dev-bot-status.md', description: 'Project-relative volatile status Markdown path.', parse: configTypes.string },
   loadReportProject: { env: 'TLDA_DEV_BOT_LOAD_REPORT_PROJECT', default: 'mini-load', description: 'Project name for the live Mini load OJS report.', parse: configTypes.string },
   loadReportSourceFile: { env: 'TLDA_DEV_BOT_LOAD_REPORT_SOURCE_FILE', default: 'index.qmd', description: 'Main QMD file for the live Mini load OJS report.', parse: configTypes.string },
   loadReportDataFile: { env: 'TLDA_DEV_BOT_LOAD_REPORT_DATA_FILE', default: 'mini-load.csv', description: 'CSV source file appended by the live Mini load OJS report publisher.', parse: configTypes.string },
@@ -2345,7 +2344,6 @@ export async function checkResourceCleanup({
   forceFullSweep = false,
   worktreeBudgetBytes = undefined,
   now = () => Date.now(),
-  publish = publishStatus,
 } = {}) {
   if (resourceCleanupInFlight) return { skipped: true, reason: 'previous cleanup still in flight' }
   resourceCleanupInFlight = true
@@ -2437,10 +2435,6 @@ export async function checkResourceCleanup({
         for (const err of harnessRollouts.errors || []) {
           errors.push(`harness-rollout ${err}`)
         }
-      }
-
-      if (typeof bot !== 'undefined' && bot?.isCanonical?.()) {
-        await publish().catch(error => errors.push(`status publish: ${error.message}`))
       }
     }
 
@@ -3270,7 +3264,7 @@ export function renderStatusMarkdown(samples = statusSamples) {
   ${points.map(point => `<circle cx="${point.x}" cy="${point.y}" r="5" fill="#2563eb" tabindex="0"><title>${point.ts}: ${formatBytes(point.totalBytes)}</title></circle>`).join('\n  ')}
 </svg>`
   return [
-    '# Dev bot disk and worktree status {.volatile}',
+    '# Dev bot disk and worktree status',
     '',
     findings,
     '',
@@ -3290,19 +3284,6 @@ export function renderStatusMarkdown(samples = statusSamples) {
     '',
     '<details><summary>How to read the timeline</summary>Each point is one completed cleanup sweep. Hover or focus a point for its timestamp and measured total.</details>',
   ].join('\n')
-}
-
-export async function publishStatus({ transport = bot, samples = statusSamples } = {}) {
-  const requestId = `dev-status:${randomUUID()}`
-  const result = await transport.sendAndWait({
-    type: 'source-change',
-    project: 'info',
-    files: [{ path: config.statusFile, content: renderStatusMarkdown(samples) }],
-    editedBy: AGENT_ID,
-    requestId,
-  }, message => message.type === 'source-change-result' && message.requestId === requestId, REQUEST_TIMEOUT_MS)
-  if (!result.ok) throw new Error(result.error || `source update failed (${result.status || result.httpStatus})`)
-  return `[Dev bot disk and worktree status](/docs/info/${encodeURIComponent(config.statusFile.replace(/\.md$/i, '.html'))})`
 }
 
 function miniLoadReportHref() {
@@ -3408,11 +3389,11 @@ async function refreshMiniLoadReport() {
 
 export const commands = [{
   name: 'status',
-  summary: 'Publish and return the current disk/worktree status report.',
-  help: 'Writes the current semantic Markdown report and interactive timeline to the ordinary info project through the normal source-change pipeline, then returns its project-file reference.',
+  summary: 'Return the current disk/worktree status report inline.',
+  help: 'Replies with the current Markdown report, cleanup measurements, and timeline in chat.',
   examples: ['status'],
   handler: async ({ reply }) => {
-    await reply(await publishStatus())
+    await reply(renderStatusMarkdown())
   },
 }, {
   name: 'load',
