@@ -94,12 +94,14 @@ export async function collectDiskSample({
 export function evaluateDiskSample(sample, {
   warnFreeBytes = DEFAULT_DISK_WARN_FREE_BYTES,
   criticalFreeBytes = DEFAULT_DISK_CRITICAL_FREE_BYTES,
+  wasTripped = false,
 } = {}) {
   if (!sample || !Number.isFinite(sample.freeBytes) || !Number.isFinite(sample.totalBytes)) {
     throw new BoxDiskSetupError('disk sample is missing numeric freeBytes/totalBytes')
   }
   const isCritical = sample.freeBytes < criticalFreeBytes
-  const isWarn = !isCritical && sample.freeBytes < warnFreeBytes
+  const clearFreeBytes = warnFreeBytes + 1024 ** 3
+  const isWarn = !isCritical && sample.freeBytes < (wasTripped ? clearFreeBytes : warnFreeBytes)
   const level = isCritical ? 'critical' : isWarn ? 'warn' : 'ok'
   return {
     at: sample.at || null,
@@ -110,6 +112,7 @@ export function evaluateDiskSample(sample, {
     usedPct: sample.usedPct ?? Number((((sample.totalBytes - sample.freeBytes) / sample.totalBytes) * 100).toFixed(1)),
     warnFreeBytes,
     criticalFreeBytes,
+    clearFreeBytes,
     level,
     tripped: level !== 'ok',
   }
@@ -165,7 +168,7 @@ export function formatDiskNotice(verdict, {
   const effectiveUsedPct = Number.isFinite(afterSample?.usedPct) ? afterSample.usedPct : verdict.usedPct
   const thresholdBytes = verdict.level === 'critical' ? verdict.criticalFreeBytes : verdict.warnFreeBytes
   const parts = [
-    `${verdict.level.toUpperCase()} disk headroom on ${verdict.mountPoint}: ${formatGiB(effectiveFreeBytes)} free of ${formatGiB(verdict.totalBytes)} (${effectiveUsedPct}% used; ${verdict.level} floor is ${formatGiB(thresholdBytes)} free)`,
+    `${verdict.level.toUpperCase()} disk headroom on ${verdict.mountPoint}: ${formatGiB(effectiveFreeBytes)} free of ${formatGiB(verdict.totalBytes)} (${effectiveUsedPct}% used; ${verdict.level} floor is ${formatGiB(thresholdBytes)} free; clears at ${formatGiB(verdict.clearFreeBytes)})`,
   ]
   if (Number.isFinite(afterSample?.freeBytes) && afterSample.freeBytes !== verdict.freeBytes) {
     parts.push(`before cleanup: ${formatGiB(verdict.freeBytes)} free`)

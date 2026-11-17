@@ -2285,7 +2285,10 @@ function summarizeCleanupReclaimed(cleanupDetail) {
   return parts.length ? parts.join(', ') : '0 B reclaimed'
 }
 
+const boxDiskState = { tripped: false }
+
 export async function checkBoxDisk({
+  state = boxDiskState,
   sampleDisk = () => collectDiskSample(),
   warnFreeBytes = DEFAULT_DISK_WARN_FREE_BYTES,
   criticalFreeBytes = DEFAULT_DISK_CRITICAL_FREE_BYTES,
@@ -2296,7 +2299,8 @@ export async function checkBoxDisk({
   let verdict
   try {
     sample = await sampleDisk()
-    verdict = evaluateDiskSample(sample, { warnFreeBytes, criticalFreeBytes })
+    verdict = evaluateDiskSample(sample, { warnFreeBytes, criticalFreeBytes, wasTripped: state.tripped })
+    state.tripped = verdict.tripped
   } catch (e) {
     if (e instanceof BoxDiskSetupError || e?.setupFailure) {
       throw new ProbeSetupError(`box-disk: ${e.message}`)
@@ -2667,6 +2671,20 @@ function splitFailureSubjectBlocks(error) {
 
 function keyForFailureSubject(name, error) {
   const lines = String(error || '').split('\n').map(line => line.trim()).filter(Boolean)
+  // These notices carry volatile measurements alongside their alert state.
+  // Read only the state into the key, for both live reports and heartbeat
+  // restoration; retain the complete measurement text in the notice body.
+  if (name === 'box-disk') {
+    const disk = lines[0]?.match(/^(WARN|CRITICAL) disk headroom on (.+?):/)
+    if (disk) return `${name}:${disk[2]}:${disk[1]}`
+  }
+  if (name === 'box-memory' && lines[0]?.startsWith('**box-memory:')) {
+    const pressure = lines.find(line => line.startsWith('- sample '))?.match(/; pressure (\d+) /)?.[1]
+    if (pressure !== undefined) {
+      const legs = ['pressure', 'swapout-rate', 'climber'].filter(leg => lines[0].includes(leg))
+      return `${name}:pressure=${pressure}:legs=${legs.join(',')}`
+    }
+  }
   const subject = failureSubjectKey(lines[0] || '')
   const reasons = lines
     .filter(line => line.startsWith('- '))
@@ -3436,6 +3454,7 @@ if (process.env.TLDA_DEV_BOT_NO_START !== '1') {
   }).start()
 
   activeFailure = restoreActiveFailure()
+  boxDiskState.tripped = /^box-disk: (WARN|CRITICAL) disk headroom on /m.test(activeFailure?.summary || '')
   writeHeartbeat('startup', {
     intervalMs: INTERVAL_MS,
     ...(activeFailure ? { restoredFailure: activeFailure.summary.split('\n')[0], repeats: activeFailure.repeats } : {}),
