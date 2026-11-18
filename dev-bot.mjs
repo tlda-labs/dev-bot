@@ -2730,6 +2730,27 @@ function firstFailureLine(summary) {
   return String(summary || '').split('\n').map(line => line.trim()).find(Boolean) || 'same failure signature'
 }
 
+function failureCoverage(report) {
+  const results = report.results || []
+  const passed = results.filter(r => r.ok && !r.skipped && !r.blocked).map(r => r.name)
+  const failed = results.filter(r => !r.ok && !r.skipped && !r.blocked).map(r => r.name)
+  const skipped = results.filter(r => r.skipped && !r.blocked)
+    .map(r => `${r.name}:${r.detail?.reason || 'skipped'}`)
+  const blocked = [...new Set([
+    ...results.filter(r => r.blocked).map(r => `${r.name}:${r.detail?.reason || 'blocked'}`),
+    ...(report.blocked || []),
+  ])]
+  const missing = report.missing || []
+  return [
+    'Coverage in this sweep:',
+    results.length ? `- Passed: ${passed.join('; ') || 'none'}` : '- No check results were recorded.',
+    ...(failed.length ? [`- Attempted and failed: ${failed.join('; ')}`] : []),
+    ...(skipped.length ? [`- Skipped: ${skipped.join('; ')}`] : []),
+    ...(blocked.length ? [`- Blocked or incomplete: ${blocked.join('; ')}`] : []),
+    ...(missing.length ? [`- Not run: ${missing.join('; ')}`] : []),
+  ].join('\n')
+}
+
 export function composeFailureNudgeMessage({ report, unchanged, standingFor, firstAt, fellBack }) {
   const message = [
     unchanged
@@ -2749,7 +2770,7 @@ export function composeFailureNudgeMessage({ report, unchanged, standingFor, fir
     `Fleet: \`${FLEET_SERVER}\``,
     `Store: \`${STORE_SERVER}\``,
     '',
-    'Coverage: real document SVG load; disposable identity chat round trip confirmed by history read-back; real MCP login/inbox/chat/thread surface; Claude/Codex live notification consumption canaries; async agent join coherence; bot heartbeat outcomes; disposable linked Git remote source/render/history, reverse commit, conflict/no-overwrite; opt-in core phi spawn/wake path.',
+    failureCoverage(report),
   ].join('\n')
   return message
 }
