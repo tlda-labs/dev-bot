@@ -7,6 +7,7 @@ const { checkBoxDisk, checkBoxMemory, runChecks, failureKey, failureNudgeMessage
 const GiB = 1024 ** 3
 const diskSample = free => ({ freeBytes: free * GiB, totalBytes: 460 * GiB, mountPoint: '/data' })
 const diskReport = (state, free, cleanup = {}) => runChecks({ checks: [['box-disk', () => checkBoxDisk({
+  loadPerCore: () => 0.2,
   state, sampleDisk: async () => diskSample(free), runCleanup: async () => cleanup,
   sampleTopConsumers: async () => [{ path: '/cache', bytes: free * GiB }],
 })]] })
@@ -26,6 +27,7 @@ test('disk cleanup and consumer detail cannot change the signature; severity sti
   const state = { tripped: false }
   const first = await diskReport(state, 49.7, { skipped: true, reason: 'previous cleanup still in flight' })
   const later = await runChecks({ checks: [['box-disk', () => checkBoxDisk({
+    loadPerCore: () => 0.2,
     state,
     sampleDisk: (() => { let n = 0; return async () => diskSample(n++ ? 50.2 : 49.8) })(),
     runCleanup: async () => ({ worktrees: { evicted: 1, totalBytes: GiB, retainedBytes: 0 } }),

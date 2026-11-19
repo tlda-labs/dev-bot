@@ -2290,6 +2290,7 @@ const boxDiskState = { tripped: false }
 export async function checkBoxDisk({
   state = boxDiskState,
   sampleDisk = () => collectDiskSample(),
+  loadPerCore = () => os.loadavg()[0] / os.availableParallelism(),
   warnFreeBytes = DEFAULT_DISK_WARN_FREE_BYTES,
   criticalFreeBytes = DEFAULT_DISK_CRITICAL_FREE_BYTES,
   runCleanup = options => checkResourceCleanup(options),
@@ -2315,6 +2316,15 @@ export async function checkBoxDisk({
       totalBytes: verdict.totalBytes,
       usedPct: verdict.usedPct,
       level: verdict.level,
+    }
+  }
+
+  // Keep sampling free space during author work. A warning is not an
+  // emergency that warrants walking the whole disk on every probe.
+  if (verdict.level === 'warn') {
+    const load = loadPerCore()
+    if (load >= 0.5) {
+      throw new Error(`${formatDiskNotice(verdict)}\nFull cleanup and directory scans deferred at one-minute load ${load.toFixed(2)} per core.`)
     }
   }
 

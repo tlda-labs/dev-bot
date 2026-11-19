@@ -108,6 +108,7 @@ test('checkBoxDisk triggers on-demand cleanup and alerts with reclaimed summary 
   ]
   await assert.rejects(
     checkBoxDisk({
+      loadPerCore: () => 0.2,
       sampleDisk: async () => warnSamples[Math.min(sampleIdx++, warnSamples.length - 1)],
       runCleanup: async options => {
         cleanupCalls.push(options)
@@ -147,6 +148,19 @@ test('checkBoxDisk triggers on-demand cleanup and alerts with reclaimed summary 
     /CRITICAL disk headroom on \/System\/Volumes\/Data: 18\.0 GiB free/,
   )
   assert.deepEqual(critCalls, [{ forceFullSweep: true, worktreeBudgetBytes: 0 }])
+})
+
+test('busy Mini reports fresh disk warnings without starting either recursive walk', async () => {
+  let walks = 0
+  const walk = async () => { walks++ }
+  await assert.rejects(checkBoxDisk({
+    state: { tripped: false },
+    sampleDisk: async () => parseDfKilobyteTable(dfRow({ totalGiB: 460, usedGiB: 417, availGiB: 43 })),
+    loadPerCore: () => 2.4,
+    runCleanup: walk,
+    sampleTopConsumers: walk,
+  }), /WARN disk headroom[\s\S]*2\.40 per core/)
+  assert.equal(walks, 0)
 })
 
 test('nudgeTargets queries on-call & !human & !bot and never targets humans, bots, or fleet:skip', async () => {
