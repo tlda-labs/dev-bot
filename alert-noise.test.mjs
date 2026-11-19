@@ -26,6 +26,7 @@ test('disk alert survives floor flapping and clears only at 51 GiB', async () =>
 test('disk cleanup and consumer detail cannot change the signature; severity still can', async () => {
   const state = { tripped: false }
   const first = await diskReport(state, 49.7, { skipped: true, reason: 'previous cleanup still in flight' })
+  assert.equal((await diskReport(state, 51)).ok, true)
   const later = await runChecks({ checks: [['box-disk', () => checkBoxDisk({
     loadPerCore: () => 0.2,
     state,

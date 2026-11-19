@@ -163,6 +163,27 @@ test('busy Mini reports fresh disk warnings without starting either recursive wa
   assert.equal(walks, 0)
 })
 
+test('a load dip during an open warning does not launch a full sweep', async () => {
+  const state = { tripped: false }
+  let walks = 0
+  const probe = (freeGiB, load) => checkBoxDisk({
+    state,
+    sampleDisk: async () => parseDfKilobyteTable(dfRow({ totalGiB: 460, usedGiB: 460 - freeGiB, availGiB: freeGiB })),
+    loadPerCore: () => load,
+    runCleanup: async () => { walks++; return {} },
+    sampleTopConsumers: async () => { walks++; return [] },
+  })
+  await assert.rejects(probe(43, 2.4), /WARN disk headroom/)
+  await assert.rejects(probe(46, 0.3), /46.0 GiB free/)
+  assert.equal(walks, 0)
+  assert.equal((await probe(51, 0.3)).level, 'ok')
+  await assert.rejects(probe(45, 0.3), /WARN disk headroom/)
+  await assert.rejects(probe(44, 0.2), /44.0 GiB free/)
+  assert.equal(walks, 2, 'the new quiet warning runs each walk once')
+  await assert.rejects(probe(20, 2.4), /CRITICAL disk headroom/)
+  assert.equal(walks, 4, 'escalation still gets emergency cleanup')
+})
+
 test('nudgeTargets queries on-call & !human & !bot and never targets humans, bots, or fleet:skip', async () => {
   const queries = []
   const resolved = await nudgeTargets({

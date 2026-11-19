@@ -2298,9 +2298,10 @@ export async function checkBoxDisk({
 } = {}) {
   let sample
   let verdict
+  const wasTripped = state.tripped
   try {
     sample = await sampleDisk()
-    verdict = evaluateDiskSample(sample, { warnFreeBytes, criticalFreeBytes, wasTripped: state.tripped })
+    verdict = evaluateDiskSample(sample, { warnFreeBytes, criticalFreeBytes, wasTripped })
     state.tripped = verdict.tripped
   } catch (e) {
     if (e instanceof BoxDiskSetupError || e?.setupFailure) {
@@ -2319,12 +2320,13 @@ export async function checkBoxDisk({
     }
   }
 
-  // Keep sampling free space during author work. A warning is not an
-  // emergency that warrants walking the whole disk on every probe.
+  // An initial warning may justify a walk. While it stands, report fresh
+  // free space and leave further maintenance on its regular schedule.
   if (verdict.level === 'warn') {
+    if (wasTripped) throw new Error(formatDiskNotice(verdict))
     const load = loadPerCore()
     if (load >= 0.5) {
-      throw new Error(`${formatDiskNotice(verdict)}\nFull cleanup and directory scans deferred at one-minute load ${load.toFixed(2)} per core.`)
+      throw new Error(`${formatDiskNotice(verdict)}\nFull cleanup and directory scans skipped at one-minute load ${load.toFixed(2)} per core.`)
     }
   }
 
