@@ -5,8 +5,12 @@ import { promisify } from 'util'
 
 const execFileP = promisify(execFile)
 
-export const DEFAULT_DISK_WARN_FREE_BYTES = 50 * 1024 ** 3
-export const DEFAULT_DISK_CRITICAL_FREE_BYTES = 30 * 1024 ** 3
+const envGiB = (name, fallback) => {
+  const v = Number(process.env[name])
+  return (Number.isFinite(v) && v > 0 ? v : fallback) * 1024 ** 3
+}
+export const DEFAULT_DISK_WARN_FREE_BYTES = envGiB('TLDA_DEV_BOT_DISK_WARN_GIB', 50)
+export const DEFAULT_DISK_CRITICAL_FREE_BYTES = envGiB('TLDA_DEV_BOT_DISK_CRITICAL_GIB', 30)
 export const DEFAULT_DISK_MOUNT_CANDIDATES = ['/System/Volumes/Data', '/']
 
 export class BoxDiskSetupError extends Error {
