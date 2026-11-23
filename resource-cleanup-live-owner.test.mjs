@@ -266,7 +266,7 @@ test('actual caller reports acquire and release failures through the existing er
   assert.ok(start >= 0 && end > start)
   // Evaluate the real existing caller without importing or starting the bot.
   const check = vm.runInNewContext(entry.slice(start, end).replace(/^export /, '') + '\ncheckResourceCleanup', {
-    resourceCleanupInFlight: false, lastWorktreeCleanupAt: 0, WORKTREE_CLEANUP_INTERVAL_MS: 60000,
+    resourceCleanupRun: null, lastWorktreeCleanupAt: 0, WORKTREE_CLEANUP_INTERVAL_MS: 60000,
   })
   const invoke = sweep => check({
     previewReaper: () => ({ reaped: [], failed: [] }),
