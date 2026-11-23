@@ -1023,3 +1023,34 @@ test('resource cleanup scans current state and returns bounded summary', async (
   assert.deepEqual(result.previews, { reaped: 1, failed: 0 })
   assert.deepEqual(result.playwright, [{ session: 'shared', state: 'claimed' }])
 })
+
+test('a forced cleanup waits out a running sweep and reports its own result, not "still in flight"', async () => {
+  const worktrees = { totalBytes: 10, retainedBytes: 4, overBudgetBytes: 0, removedWorktrees: [], evicted: [{}], pinned: [], abandoned: [], unremovable: [] }
+  let release
+  const gate = new Promise(resolve => { release = resolve })
+  const scheduled = checkResourceCleanup({
+    previewReaper: () => ({ reaped: [], failed: [] }),
+    playwrightCleanup: { sweep: async () => { await gate; return [] } },
+    worktreeCleanupDriver: { sweep: async () => worktrees },
+    now: () => 0,
+  })
+  const overlapping = await checkResourceCleanup({
+    previewReaper: () => ({ reaped: [], failed: [] }),
+    playwrightCleanup: { sweep: async () => [] },
+    worktreeCleanupDriver: { sweep: async () => worktrees },
+    now: () => 0,
+  })
+  assert.deepEqual(overlapping, { skipped: true, reason: 'previous cleanup still in flight' }, 'an unforced overlap still skips')
+  const forced = checkResourceCleanup({
+    previewReaper: () => ({ reaped: [], failed: [] }),
+    playwrightCleanup: { sweep: async () => [] },
+    worktreeCleanupDriver: { sweep: async () => worktrees },
+    forceFullSweep: true,
+    now: () => 0,
+  })
+  release()
+  await scheduled
+  const result = await forced
+  assert.equal(result.skipped, undefined)
+  assert.equal(result.worktrees.evicted, 1)
+})

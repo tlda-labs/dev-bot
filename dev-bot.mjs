@@ -256,7 +256,7 @@ const boxMemoryWatch = createBoxMemoryWatch({
 })
 const climberReaper = createClimberReaper()
 let resourceCleanupTimer = null
-let resourceCleanupInFlight = false
+let resourceCleanupRun = null
 let lastWorktreeCleanupAt = 0
 const statusSamples = []
 let miniLoadReportTimer = null
@@ -2361,9 +2361,26 @@ export async function checkResourceCleanup({
   worktreeBudgetBytes = undefined,
   now = () => Date.now(),
 } = {}) {
-  if (resourceCleanupInFlight) return { skipped: true, reason: 'previous cleanup still in flight' }
-  resourceCleanupInFlight = true
+  // The disk probe forces a full sweep and reports what it freed. When the
+  // scheduled sweep is already running, the forced one waits for it and then
+  // runs, so the notice says what was reclaimed rather than that it was
+  // skipped (Nov 23: "still in flight" since Nov 19 read as a stuck cleanup).
+  // The scheduled sweep still skips an overlap; its next turn comes anyway.
+  while (resourceCleanupRun) {
+    if (!forceFullSweep) return { skipped: true, reason: 'previous cleanup still in flight' }
+    await resourceCleanupRun.catch(() => {})
+  }
+  const run = runResourceCleanup({ previewReaper, playwrightCleanup, worktreeCleanupDriver, configLogCleanupDriver, claudeTmpCleanupDriver, harnessRolloutCleanupDriver, forceFullSweep, worktreeBudgetBytes, now })
+  resourceCleanupRun = run
   try {
+    return await run
+  } finally {
+    if (resourceCleanupRun === run) resourceCleanupRun = null
+  }
+}
+
+async function runResourceCleanup({ previewReaper, playwrightCleanup, worktreeCleanupDriver, configLogCleanupDriver, claudeTmpCleanupDriver, harnessRolloutCleanupDriver, forceFullSweep, worktreeBudgetBytes, now }) {
+  {
     const previews = previewReaper()
     const results = await playwrightCleanup.sweep()
     const errors = [
@@ -2456,8 +2473,6 @@ export async function checkResourceCleanup({
 
     if (errors.length) throw new Error(errors.join('\n'))
     return summary
-  } finally {
-    resourceCleanupInFlight = false
   }
 }
 
