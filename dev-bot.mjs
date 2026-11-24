@@ -1635,8 +1635,8 @@ async function lookupAgentsByIds(ids) {
   return agents
 }
 
-async function botSenderIds() {
-  const rows = await fleetTableRows('bot')
+async function botSenderIds(rosterRows = fleetTableRows) {
+  const rows = await rosterRows('bot')
   return new Set(rows.map(row => row.id).filter(Boolean))
 }
 
@@ -1644,8 +1644,8 @@ async function botSenderIds() {
 // message delivered to an agent writes a `user` entry the moment it lands, so
 // counting any entry would let the delivery itself stand as evidence that the
 // agent reacted to the delivery.
-async function lastProducedAt(agentId) {
-  const result = await sendRequest({
+async function lastProducedAt(agentId, request = sendRequest) {
+  const result = await request({
     type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId,
     historyOnly: true, role: 'assistant', limit: 1,
   }, 10_000).catch(e => { throw new ProbeSetupError(`session history for ${agentId} did not answer: ${e.message}`) })
@@ -1658,8 +1658,8 @@ async function lastProducedAt(agentId) {
 // over three days of testing history, todd check-ins and build notices were 15
 // of the 37 raw instances of this condition and every one of them was benign.
 // An agent does not owe a bot nudge a reaction.
-async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
-  const rows = await chatRows(agentId, sinceIso)
+async function lastRealDeliveryTo(agentId, botIds, sinceIso, request = sendRequest) {
+  const rows = await chatRows(agentId, sinceIso, request)
   const received = rows.filter(row =>
     row.from && row.from !== agentId && !botIds.has(row.from) &&
     (Array.isArray(row.recipients) ? row.recipients.includes(agentId) : true))
@@ -1667,8 +1667,8 @@ async function lastRealDeliveryTo(agentId, botIds, sinceIso) {
   return received[0] || null
 }
 
-async function chatRows(agentId, sinceIso) {
-  const result = await sendRequest({
+async function chatRows(agentId, sinceIso, request = sendRequest) {
+  const result = await request({
     type: 'fleet-search', query: '', me: AGENT_ID, agent: agentId, agentOnly: true,
     historyOnly: true, eventOnly: true, eventType: 'chat', since: sinceIso, limit: 50,
   }, 10_000).catch(e => { throw new ProbeSetupError(`chat history for ${agentId} did not answer: ${e.message}`) })
@@ -1681,8 +1681,29 @@ async function chatRows(agentId, sinceIso) {
 // nothing (app-qc-reviewer, 2026-11-11). Read from the delivery forward:
 // paging runs oldest-first, so a read over the whole lookback returns a busy
 // agent's oldest fifty chats and never reaches its recent ones.
-async function sentChatSince(agentId, sinceIso) {
-  return (await chatRows(agentId, sinceIso)).some(row => row.from === agentId && String(row.timestamp || '') > sinceIso)
+async function sentChatSince(agentId, sinceIso, request = sendRequest) {
+  return (await chatRows(agentId, sinceIso, request)).some(row => row.from === agentId && String(row.timestamp || '') > sinceIso)
+}
+
+// Mail the agent has read is handled, whether or not it was ever delivered: a
+// seat with no notification channel reads by pulling at login, so its mail is
+// accepted, never delivered, and read. The server's `unread-count` is the count
+// of this agent's `recipients` rows with `read = 0` -- the same per-recipient
+// flag a chat row's `read`/`readBy` come from. None unread means the message
+// this check found has been read. Anything other than a count is not measured
+// and is returned as null, which never reads as "read".
+async function unreadCount(agentId, request = sendRequest) {
+  const result = await request({ type: 'unread-count', agent: agentId }, 10_000)
+    .catch(e => { throw new ProbeSetupError(`unread count for ${agentId} did not answer: ${e.message}`) })
+  return Number.isInteger(result?.count) ? result.count : null
+}
+
+// A cloud session has no daemon: the server marks it alive while its own MCP
+// socket is logged in, with liveness source `cloud-mcp-connected`. It has no
+// tmux session here and no `permission_grants` row anywhere by design, so those
+// absences say nothing about it.
+function rowIsCloudSeat(row) {
+  return row?.runtime_status?.evidence?.liveness_source === 'cloud-mcp-connected'
 }
 
 // One roster read per cadence window. `lastResult` is replayed on a
@@ -1882,8 +1903,12 @@ export async function checkAgentReceiving() {
   }
 }
 
-async function runAgentReceiving() {
-  const rows = (await fleetTableRows('awake')).filter(rowIsWatchable)
+export async function runAgentReceiving({
+  rosterRows = fleetTableRows,
+  request = sendRequest,
+  placement = { daemonCanPlace, daemonKnowsAnywhere, hasLocalSession },
+} = {}) {
+  const rows = (await rosterRows('awake')).filter(rowIsWatchable)
   if (!rows.length) return { skipped: true, reason: 'no watchable awake agents' }
 
   // Cheap pre-filter: an agent whose client reached us inside the window is
@@ -1897,7 +1922,7 @@ async function runAgentReceiving() {
     })
     : rows
 
-  const botIds = await botSenderIds()
+  const botIds = await botSenderIds(rosterRows)
   const sinceIso = new Date(now - AGENT_SILENCE_LOOKBACK_MS).toISOString()
   const silent = []
   // `filter=awake` IS the liveness gate. The runtime projection only calls an
@@ -1911,13 +1936,14 @@ async function runAgentReceiving() {
   // true positive it existed to catch. `last_seen` is reported below as context
   // and is not a precondition.
   for (const row of candidates) {
-    const delivery = await lastRealDeliveryTo(row.id, botIds, sinceIso)
+    const delivery = await lastRealDeliveryTo(row.id, botIds, sinceIso, request)
     if (!delivery?.timestamp) continue
     const deliveredAt = Date.parse(delivery.timestamp)
     // Not yet decidable: the window has not elapsed since the delivery.
     if (!Number.isFinite(deliveredAt) || now - deliveredAt < AGENT_SILENCE_WINDOW_MS) continue
-    if (await sentChatSince(row.id, delivery.timestamp)) continue
-    const produced = await lastProducedAt(row.id)
+    if (await unreadCount(row.id, request) === 0) continue
+    if (await sentChatSince(row.id, delivery.timestamp, request)) continue
+    const produced = await lastProducedAt(row.id, request)
     const producedAt = Date.parse(produced || '')
     if (Number.isFinite(producedAt) && producedAt > deliveredAt) continue
     silent.push({
@@ -1931,9 +1957,12 @@ async function runAgentReceiving() {
       lastSeenAgoS: row.last_seen_ago_s,
       activity: row.activity || null,
       tool: row.tool || null,
-      placeable: daemonCanPlace(row.id),
-      knownAnywhere: daemonKnowsAnywhere(row.id),
-      localSession: hasLocalSession(row.name || null),
+      cloudSeat: rowIsCloudSeat(row),
+      ...(rowIsCloudSeat(row) ? {} : {
+        placeable: placement.daemonCanPlace(row.id),
+        knownAnywhere: placement.daemonKnowsAnywhere(row.id),
+        localSession: placement.hasLocalSession(row.name || null),
+      }),
     })
   }
 
@@ -1948,7 +1977,8 @@ async function runAgentReceiving() {
       `- last produced: ${entry.lastProducedAt || 'nothing on record'}`,
       `- last call from its own client: ${entry.lastClientCallAt || 'not reported by this server'}${entry.activity ? ` (${entry.activity}${entry.tool ? `:${entry.tool}` : ''})` : ''}`,
       `- daemon last saw the process ${entry.lastSeenAgoS}s ago`,
-      entry.placeable === false
+      entry.cloudSeat ? '- cloud seat (`cloud-mcp-connected`): no daemon, tmux session or `permission_grants` row by design' : null,
+      entry.cloudSeat ? null : entry.placeable === false
         ? '- **no `permission_grants` row for this daemon — it cannot be killed, restarted or typed into. `restart-mcp` will print `ok` and do nothing.**'
         : entry.placeable === null ? '- daemon placement: not measured (ledger unreadable)' : null,
       // A stale row and a silent agent need different actions, and until now the
